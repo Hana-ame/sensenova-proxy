@@ -1,0 +1,145 @@
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"net/url"
+	"os"
+	"strconv"
+	"strings"
+)
+
+// ProxyItem defines a single proxy mapping instance.
+// In the config JSON list, each item has four core properties:
+// - endpoint: target upstream URL (e.g. "https://token.sensenova.cn")
+// - Authkey: SenseNova API key (e.g. "sk-...")
+// - engress: outbound network binding (IPv4/IPv6 IP, interface name, or upstream proxy URL)
+// - listen: local listening address (e.g. "127.0.0.1:8001" or ":8001")
+type ProxyItem struct {
+	Endpoint string   `json:"endpoint"`
+	AuthKey  string   `json:"Authkey"`
+	Engress  string   `json:"engress"`
+	Listen   string   `json:"listen"`
+
+	// Parsed upstream target URL
+	TargetURL *url.URL `json:"-"`
+}
+
+// UnmarshalJSON supports case-insensitive and alias key names in the JSON input.
+func (p *ProxyItem) UnmarshalJSON(data []byte) error {
+	var raw map[string]interface{}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+
+	getStr := func(keys ...string) string {
+		for _, k := range keys {
+			if v, ok := raw[k]; ok && v != nil {
+				switch val := v.(type) {
+				case string:
+					return strings.TrimSpace(val)
+				case float64:
+					return strconv.FormatInt(int64(val), 10)
+				}
+			}
+		}
+		return ""
+	}
+
+	p.Endpoint = getStr("endpoint", "Endpoint", "target", "upstream", "url")
+	p.AuthKey = getStr("Authkey", "authkey", "AuthKey", "auth_key", "apiKey", "api_key", "key", "token")
+	p.Engress = getStr("engress", "egress", "Engress", "Egress", "outbound", "source_ip", "interface")
+	p.Listen = getStr("listen", "Listen", "addr", "address", "bind", "port")
+
+	return nil
+}
+
+// Validate normalizes and checks each configuration item.
+func (p *ProxyItem) Validate(index int) error {
+	// Endpoint validation & normalization
+	if p.Endpoint == "" {
+		p.Endpoint = "https://token.sensenova.cn"
+	}
+	if !strings.HasPrefix(p.Endpoint, "http://") && !strings.HasPrefix(p.Endpoint, "https://") {
+		p.Endpoint = "https://" + p.Endpoint
+	}
+	p.Endpoint = strings.TrimRight(p.Endpoint, "/")
+
+	u, err := url.Parse(p.Endpoint)
+	if err != nil || u.Host == "" {
+		return fmt.Errorf("config item[%d]: invalid endpoint '%s': %w", index, p.Endpoint, err)
+	}
+	p.TargetURL = u
+
+	// Listen address validation & normalization
+	if p.Listen == "" {
+		return fmt.Errorf("config item[%d]: listen address is required (e.g. '127.0.0.1:8001')", index)
+	}
+	if !strings.Contains(p.Listen, ":") {
+		// e.g. "8001" -> "127.0.0.1:8001"
+		p.Listen = "127.0.0.1:" + p.Listen
+	}
+
+	return nil
+}
+
+// LoadConfig reads and parses the JSON configuration file.
+// Supports both a JSON array of items:
+//   [ {"endpoint": "...", "Authkey": "...", "engress": "...", "listen": "..."}, ... ]
+// and a JSON object containing a list:
+//   { "proxies": [ ... ] }
+func LoadConfig(path string) ([]ProxyItem, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read config file: %w", err)
+	}
+
+	var items []ProxyItem
+	trimmed := strings.TrimSpace(string(data))
+	if strings.HasPrefix(trimmed, "[") {
+		if err := json.Unmarshal(data, &items); err != nil {
+			return nil, fmt.Errorf("parse JSON array: %w", err)
+		}
+	} else if strings.HasPrefix(trimmed, "{") {
+		var wrapper struct {
+			Proxies []ProxyItem `json:"proxies"`
+			Servers []ProxyItem `json:"servers"`
+			List    []ProxyItem `json:"list"`
+			Items   []ProxyItem `json:"items"`
+		}
+		if err := json.Unmarshal(data, &wrapper); err != nil {
+			return nil, fmt.Errorf("parse JSON object: %w", err)
+		}
+		if len(wrapper.Proxies) > 0 {
+			items = wrapper.Proxies
+		} else if len(wrapper.Servers) > 0 {
+			items = wrapper.Servers
+		} else if len(wrapper.List) > 0 {
+			items = wrapper.List
+		} else if len(wrapper.Items) > 0 {
+			items = wrapper.Items
+		} else {
+			// Single object format fallback
+			var single ProxyItem
+			if err := json.Unmarshal(data, &single); err == nil && single.Listen != "" {
+				items = []ProxyItem{single}
+			} else {
+				return nil, fmt.Errorf("JSON object does not contain a valid proxies list")
+			}
+		}
+	} else {
+		return nil, fmt.Errorf("config must start with '[' (array) or '{' (object)")
+	}
+
+	if len(items) == 0 {
+		return nil, fmt.Errorf("no proxy entries found in config")
+	}
+
+	for i := range items {
+		if err := items[i].Validate(i); err != nil {
+			return nil, err
+		}
+	}
+
+	return items, nil
+}

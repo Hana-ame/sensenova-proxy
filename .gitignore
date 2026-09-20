@@ -1,0 +1,15 @@
+# Binaries
+sensenova-proxy
+sensenova-proxy.exe
+*.exe
+*.test
+*.zip
+*.tar.gz
+
+# Local config containing real keys
+config.json
+
+# IDE / OS
+.DS_Store
+.vscode/
+.idea/

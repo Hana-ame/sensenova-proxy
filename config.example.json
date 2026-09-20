@@ -1,0 +1,26 @@
+[
+  {
+    "endpoint": "https://token.sensenova.cn",
+    "Authkey": "sk-example-key-instance-1",
+    "engress": "192.168.1.101",
+    "listen": "127.0.0.1:8001"
+  },
+  {
+    "endpoint": "https://token.sensenova.cn",
+    "Authkey": "sk-example-key-instance-2",
+    "engress": "eth0",
+    "listen": "127.0.0.1:8002"
+  },
+  {
+    "endpoint": "https://token.sensenova.cn",
+    "Authkey": "sk-example-key-instance-3",
+    "engress": "socks5://127.0.0.1:1080",
+    "listen": "127.0.0.1:8003"
+  },
+  {
+    "endpoint": "https://token.sensenova.cn",
+    "Authkey": "sk-example-key-instance-4",
+    "engress": "",
+    "listen": "127.0.0.1:8004"
+  }
+]
