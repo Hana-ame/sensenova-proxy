@@ -1,0 +1,133 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "stable"
+          cache: true
+
+      - name: Run unit tests
+        run: go test -v ./...
+
+  build:
+    name: Build Binary
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - goos: windows
+            goarch: amd64
+            ext: .exe
+          - goos: windows
+            goarch: arm64
+            ext: .exe
+          - goos: linux
+            goarch: amd64
+            ext: ""
+          - goos: linux
+            goarch: arm64
+            ext: ""
+          - goos: darwin
+            goarch: amd64
+            ext: ""
+          - goos: darwin
+            goarch: arm64
+            ext: ""
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "stable"
+          cache: true
+
+      - name: Build binary
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 0
+        run: |
+          BINARY_NAME="sensenova-proxy${{ matrix.ext }}"
+          go build -trimpath -ldflags="-s -w" -o "${BINARY_NAME}" .
+
+          DIST_DIR="dist/${{ matrix.goos }}-${{ matrix.goarch }}"
+          mkdir -p "${DIST_DIR}"
+
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            cp "${BINARY_NAME}" "dist/sensenova-proxy-windows-${{ matrix.goarch }}.exe"
+            zip -9 "dist/sensenova-proxy-windows-${{ matrix.goarch }}.zip" "${BINARY_NAME}" start.bat config.example.json README.md
+          else
+            tar -czvf "dist/sensenova-proxy-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz" "${BINARY_NAME}" config.example.json README.md
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: assets-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: Publish Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: List Release Assets
+        run: ls -lh release-assets/
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          cat << 'BODY' > release_notes.md
+          ## SenseNova Multi-Egress Reverse Proxy
+
+          ### Features in this Release:
+          - **Zero-Buffering Real-Time Streaming**: Token-by-token instant SSE delivery without buffer lag.
+          - **Identity Encoding Enforcement**: Prevents upstream Gzip/brotli buffering for streaming endpoints.
+          - **Cloudflare Tracking Header & Cookie Stripping**: Thoroughly eliminates all `CF-*`, `NEL`, `Report-To`, `CDN-Loop`, `Server: cloudflare`, and `__cf_*` bot tracking cookies.
+          - **Auth Key Isolation**: Automatically excludes client original credentials from incoming requests and injects configured instance API keys.
+          - **Multi-Instance Concurrency & Dedicated Egress**: Independent interface, IP, or proxy routing per port.
+
+          ### Windows Quick Start:
+          1. Download `sensenova-proxy-windows-amd64.zip`.
+          2. Extract files, rename `config.example.json` to `config.json`, and set your target keys/ports.
+          3. Double-click `start.bat` to launch.
+          BODY
+
+          gh release view "${TAG_NAME}" --repo "${{ github.repository }}" >/dev/null 2>&1 || \
+            gh release create "${TAG_NAME}" release-assets/* \
+              --repo "${{ github.repository }}" \
+              --title "${TAG_NAME}" \
+              --notes-file release_notes.md
