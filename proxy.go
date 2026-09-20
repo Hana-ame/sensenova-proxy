@@ -227,9 +227,15 @@ func BuildProxyHandler(item ProxyItem, tr *http.Transport) (http.Handler, error)
 		}
 	}
 
-	// ModifyResponse injects CORS headers and ensures anti-buffering headers while passing all upstream headers intact
+	// ModifyResponse strips cf-* headers, ensures anti-buffering headers, and injects CORS headers while passing all other upstream headers
 	proxy.ModifyResponse = func(resp *http.Response) error {
-		// Pass all headers from upstream intact (never delete cf-* or any other headers).
+		// Strip cf-* headers from upstream response
+		for k := range resp.Header {
+			if strings.HasPrefix(strings.ToLower(k), "cf-") {
+				resp.Header.Del(k)
+			}
+		}
+
 		// Set anti-buffering hints for downstream clients / proxies
 		resp.Header.Set("X-Accel-Buffering", "no")
 

@@ -191,9 +191,9 @@ func TestAuthKeyAndPassthrough(t *testing.T) {
 		t.Errorf("expected body '%s', got '%s'", requestPayload, receivedBody)
 	}
 
-	// Verify all upstream headers (including cf-ray, X-Custom-Upstream) are preserved and passed through
-	if cfRay := resp.Header.Get("cf-ray"); cfRay != "123456789-mock" {
-		t.Errorf("expected cf-ray header to be passed through, got '%s'", cfRay)
+	// Verify cf-* headers are stripped, while custom upstream headers are preserved
+	if cfRay := resp.Header.Get("cf-ray"); cfRay != "" {
+		t.Errorf("expected cf-ray header to be stripped, got '%s'", cfRay)
 	}
 	if custom := resp.Header.Get("X-Custom-Upstream"); custom != "preserved-value" {
 		t.Errorf("expected X-Custom-Upstream 'preserved-value', got '%s'", custom)
