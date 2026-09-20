@@ -140,6 +140,44 @@ func setCORSHeaders(rw http.ResponseWriter, req *http.Request) {
 	rw.Header().Set("Cross-Origin-Resource-Policy", "cross-origin")
 }
 
+// isCloudflareHeader checks if an HTTP header is injected by Cloudflare for tracking, CDN telemetry, or identification.
+func isCloudflareHeader(name, val string) bool {
+	lowerName := strings.ToLower(name)
+	lowerVal := strings.ToLower(val)
+
+	// 1. Any header starting with cf- or x-cf- (e.g. cf-ray, cf-cache-status, cf-request-id, cf-visitor, cf-connecting-ip)
+	if strings.HasPrefix(lowerName, "cf-") || strings.HasPrefix(lowerName, "x-cf-") {
+		return true
+	}
+
+	// 2. Cloudflare telemetry and error reporting headers
+	if lowerName == "nel" || lowerName == "report-to" {
+		return true
+	}
+
+	// 3. CDN Loop and upstream tracking
+	if lowerName == "cdn-loop" {
+		return true
+	}
+
+	// 4. Server header advertising Cloudflare
+	if lowerName == "server" && strings.Contains(lowerVal, "cloudflare") {
+		return true
+	}
+
+	// 5. Deprecated Certificate Transparency header
+	if lowerName == "expect-ct" {
+		return true
+	}
+
+	// 6. Upstream Alt-Svc advertising Cloudflare HTTP/3 endpoints
+	if lowerName == "alt-svc" {
+		return true
+	}
+
+	return false
+}
+
 // responseRecorder captures the status code written to ResponseWriter for logging,
 // and ensures immediate unbuffered flushing on every single write.
 type responseRecorder struct {
@@ -214,6 +252,13 @@ func BuildProxyHandler(item ProxyItem, tr *http.Transport) (http.Handler, error)
 		req.Header.Del("Accept-Encoding")
 		req.Header.Set("Accept-Encoding", "identity")
 
+		// Strip any incoming Cloudflare tracking headers
+		for k := range req.Header {
+			if isCloudflareHeader(k, req.Header.Get(k)) {
+				req.Header.Del(k)
+			}
+		}
+
 		// Append client IP to X-Forwarded-For
 		if clientIP, _, err := net.SplitHostPort(req.RemoteAddr); err == nil {
 			if prior := req.Header.Get("X-Forwarded-For"); prior != "" {
@@ -227,12 +272,29 @@ func BuildProxyHandler(item ProxyItem, tr *http.Transport) (http.Handler, error)
 		}
 	}
 
-	// ModifyResponse strips cf-* headers, ensures anti-buffering headers, and injects CORS headers while passing all other upstream headers
+	// ModifyResponse strips all Cloudflare tracking headers, telemetry, and cookies,
+	// ensures anti-buffering headers, and injects CORS headers while passing all other upstream headers
 	proxy.ModifyResponse = func(resp *http.Response) error {
-		// Strip cf-* headers from upstream response
-		for k := range resp.Header {
-			if strings.HasPrefix(strings.ToLower(k), "cf-") {
+		// Strip all Cloudflare-injected tracking headers from upstream response
+		for k, v := range resp.Header {
+			val := ""
+			if len(v) > 0 {
+				val = v[0]
+			}
+			if isCloudflareHeader(k, val) {
 				resp.Header.Del(k)
+			}
+		}
+
+		// Filter out Cloudflare tracking cookies (__cf_bm, cf_clearance, __cfduid, etc.)
+		if cookies := resp.Header.Values("Set-Cookie"); len(cookies) > 0 {
+			resp.Header.Del("Set-Cookie")
+			for _, cookie := range cookies {
+				cookieLower := strings.ToLower(strings.TrimSpace(cookie))
+				if strings.HasPrefix(cookieLower, "__cf") || strings.HasPrefix(cookieLower, "cf_") {
+					continue // Strip Cloudflare tracking cookie
+				}
+				resp.Header.Add("Set-Cookie", cookie)
 			}
 		}
 

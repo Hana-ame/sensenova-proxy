@@ -132,7 +132,16 @@ func TestAuthKeyAndPassthrough(t *testing.T) {
 		receivedBody = string(b)
 
 		rw.Header().Set("Content-Type", "application/json; charset=utf-8")
-		rw.Header().Set("cf-ray", "123456789-mock") // must be preserved and passed through
+		rw.Header().Set("cf-ray", "123456789-mock")
+		rw.Header().Set("CF-Cache-Status", "HIT")
+		rw.Header().Set("NEL", `{"report_to":"cf-nel","max_age":604800}`)
+		rw.Header().Set("Report-To", `{"endpoints":[{"url":"https://a.nel.cloudflare.com/report/v4"}]}`)
+		rw.Header().Set("CDN-Loop", "cloudflare")
+		rw.Header().Set("Server", "cloudflare")
+		rw.Header().Set("Alt-Svc", `h3=":443"; ma=86400`)
+		rw.Header().Set("Expect-CT", `max-age=604800, report-uri="https://report-uri.cloudflare.com"`)
+		rw.Header().Add("Set-Cookie", "__cf_bm=tracking-cookie-value; path=/; HttpOnly")
+		rw.Header().Add("Set-Cookie", "app_session=normal_user_cookie; path=/")
 		rw.Header().Set("X-Custom-Upstream", "preserved-value")
 		rw.WriteHeader(http.StatusOK)
 		_, _ = rw.Write([]byte(`{"status":"success","data":[{"url":"https://example.com/image.png"}]}`))
@@ -191,10 +200,31 @@ func TestAuthKeyAndPassthrough(t *testing.T) {
 		t.Errorf("expected body '%s', got '%s'", requestPayload, receivedBody)
 	}
 
-	// Verify cf-* headers are stripped, while custom upstream headers are preserved
-	if cfRay := resp.Header.Get("cf-ray"); cfRay != "" {
-		t.Errorf("expected cf-ray header to be stripped, got '%s'", cfRay)
+	// Verify all Cloudflare tracking headers are completely stripped
+	for _, cfHeader := range []string{
+		"cf-ray", "CF-Ray", "CF-Cache-Status", "NEL", "Report-To", "CDN-Loop", "Server", "Alt-Svc", "Expect-CT",
+	} {
+		if val := resp.Header.Get(cfHeader); val != "" {
+			t.Errorf("expected Cloudflare header '%s' to be stripped, got '%s'", cfHeader, val)
+		}
 	}
+
+	// Verify Cloudflare cookies are stripped while legitimate user session cookies are retained
+	cookies := resp.Cookies()
+	var foundSessionCookie bool
+	for _, c := range cookies {
+		if strings.HasPrefix(c.Name, "__cf") || strings.HasPrefix(c.Name, "cf_") {
+			t.Errorf("expected Cloudflare cookie '%s' to be stripped", c.Name)
+		}
+		if c.Name == "app_session" && c.Value == "normal_user_cookie" {
+			foundSessionCookie = true
+		}
+	}
+	if !foundSessionCookie {
+		t.Errorf("expected app_session cookie to be preserved")
+	}
+
+	// Verify business headers are preserved intact
 	if custom := resp.Header.Get("X-Custom-Upstream"); custom != "preserved-value" {
 		t.Errorf("expected X-Custom-Upstream 'preserved-value', got '%s'", custom)
 	}
