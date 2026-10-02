@@ -11,15 +11,18 @@ import (
 
 // ProxyItem defines a single proxy mapping instance.
 // In the config JSON list, each item has four core properties:
-// - endpoint: target upstream URL (e.g. "https://token.sensenova.cn")
-// - Authkey: SenseNova API key (e.g. "sk-...")
-// - engress: outbound network binding (IPv4/IPv6 IP, interface name, or upstream proxy URL)
-// - listen: local listening address (e.g. "127.0.0.1:8001" or ":8001")
+//   - endpoint: target upstream URL (e.g. "https://token.sensenova.cn")
+//   - Authkey: SenseNova API key (e.g. "sk-...")
+//   - engress: outbound network binding (IPv4/IPv6 IP, interface name, or upstream proxy URL)
+//   - listen: local listening address (e.g. "127.0.0.1:8001" or ":8001")
+//   - provider (optional): sensenova | openai | opencode | passthrough.
+//     Auto-detected from the endpoint host when omitted (opencode.ai -> opencode).
 type ProxyItem struct {
-	Endpoint string   `json:"endpoint"`
-	AuthKey  string   `json:"Authkey"`
-	Engress  string   `json:"engress"`
-	Listen   string   `json:"listen"`
+	Endpoint string `json:"endpoint"`
+	AuthKey  string `json:"Authkey"`
+	Engress  string `json:"engress"`
+	Listen   string `json:"listen"`
+	Provider string `json:"provider"`
 
 	// Parsed upstream target URL
 	TargetURL *url.URL `json:"-"`
@@ -50,8 +53,18 @@ func (p *ProxyItem) UnmarshalJSON(data []byte) error {
 	p.AuthKey = getStr("Authkey", "authkey", "AuthKey", "auth_key", "apiKey", "api_key", "key", "token")
 	p.Engress = getStr("engress", "egress", "Engress", "Egress", "outbound", "source_ip", "interface")
 	p.Listen = getStr("listen", "Listen", "addr", "address", "bind", "port")
+	p.Provider = getStr("provider", "Provider", "mode", "upstream_type", "upstreamType", "protocol")
 
 	return nil
+}
+
+// providerIsValid reports whether a normalized provider value is known.
+func providerIsValid(p string) bool {
+	switch p {
+	case "", "sensenova", "openai", "opencode", "passthrough":
+		return true
+	}
+	return false
 }
 
 // Validate normalizes and checks each configuration item.
@@ -71,6 +84,23 @@ func (p *ProxyItem) Validate(index int) error {
 	}
 	p.TargetURL = u
 
+	// Provider normalization & validation
+	p.Provider = strings.ToLower(strings.TrimSpace(p.Provider))
+	if !providerIsValid(p.Provider) {
+		return fmt.Errorf("config item[%d]: unknown provider '%s' (want sensenova|openai|opencode|passthrough)", index, p.Provider)
+	}
+	if p.Provider == "" {
+		host := strings.ToLower(u.Hostname())
+		if host == "opencode.ai" || strings.HasSuffix(host, ".opencode.ai") {
+			p.Provider = "opencode"
+		} else {
+			p.Provider = "sensenova"
+		}
+	}
+	if p.Provider == "opencode" && p.AuthKey == "" {
+		p.AuthKey = opencodeDefaultKey
+	}
+
 	// Listen address validation & normalization
 	if p.Listen == "" {
 		return fmt.Errorf("config item[%d]: listen address is required (e.g. '127.0.0.1:8001')", index)
@@ -85,9 +115,12 @@ func (p *ProxyItem) Validate(index int) error {
 
 // LoadConfig reads and parses the JSON configuration file.
 // Supports both a JSON array of items:
-//   [ {"endpoint": "...", "Authkey": "...", "engress": "...", "listen": "..."}, ... ]
+//
+//	[ {"endpoint": "...", "Authkey": "...", "engress": "...", "listen": "..."}, ... ]
+//
 // and a JSON object containing a list:
-//   { "proxies": [ ... ] }
+//
+//	{ "proxies": [ ... ] }
 func LoadConfig(path string) ([]ProxyItem, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {

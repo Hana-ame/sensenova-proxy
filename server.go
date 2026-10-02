@@ -54,11 +54,18 @@ func (m *ProxyManager) Start() error {
 			return fmt.Errorf("proxy #%d (%s): failed to build handler: %w", i+1, item.Listen, err)
 		}
 
+		// opencode zen streams can legitimately idle for a while; give them a
+		// longer read/write budget than the default 300s.
+		readTO, writeTO := 300*time.Second, 300*time.Second
+		if item.IsOpencode() {
+			readTO, writeTO = 600*time.Second, 600*time.Second
+		}
+
 		srv := &http.Server{
 			Addr:           item.Listen,
 			Handler:        handler,
-			ReadTimeout:    300 * time.Second, // Long timeouts for LLM streaming / image gen
-			WriteTimeout:   300 * time.Second,
+			ReadTimeout:    readTO,
+			WriteTimeout:   writeTO,
 			IdleTimeout:    120 * time.Second,
 			MaxHeaderBytes: 1 << 20, // 1MB
 		}
@@ -69,8 +76,8 @@ func (m *ProxyManager) Start() error {
 			egressDesc = "(default route)"
 		}
 
-		log.Printf("🚀 [Instance #%d] Listening on http://%s -> %s [egress: %s, auth: %s]",
-			i+1, item.Listen, item.Endpoint, egressDesc, maskKey(item.AuthKey))
+		log.Printf("🚀 [Instance #%d] Listening on http://%s -> %s [provider: %s, egress: %s, auth: %s]",
+			i+1, item.Listen, item.Endpoint, item.Provider, egressDesc, maskKey(item.AuthKey))
 
 		wg.Add(1)
 		go func(s *http.Server, addr string) {

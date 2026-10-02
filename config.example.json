@@ -22,5 +22,19 @@
     "Authkey": "sk-example-key-instance-4",
     "engress": "",
     "listen": "127.0.0.1:8004"
+  },
+
+  {
+    "endpoint": "https://opencode.ai/zen/v1",
+    "Authkey": "public",
+    "engress": "",
+    "listen": "127.0.0.1:8011"
+  },
+  {
+    "endpoint": "https://opencode.ai/zen/v1",
+    "Authkey": "public",
+    "engress": "192.168.1.101",
+    "listen": "127.0.0.1:8012",
+    "provider": "opencode"
   }
 ]

@@ -1,8 +1,8 @@
 # SenseNova Multi-Egress Reverse Proxy
 
-A high-performance, standalone reverse proxy referencing [`gh/Hana-ame/api-pack`](https://github.com/Hana-ame/api-pack) tailored for SenseNova (`https://token.sensenova.cn`).
+A high-performance, standalone reverse proxy referencing [`gh/Hana-ame/api-pack`](https://github.com/Hana-ame/api-pack), tailored for SenseNova (`https://token.sensenova.cn`) **and** the OpenCode zen free-tier lane (`https://opencode.ai/zen/v1`).
 
-It provides transparent request passthrough, multi-instance concurrency, automated authentication injection, CORS repair, and dedicated outbound network egress per listening port.
+It provides transparent request passthrough, multi-instance concurrency, automated authentication injection, CORS repair, and dedicated outbound network egress per listening port. Pointing an OpenAI-compatible client at an `opencode.ai` endpoint transparently applies the gateway's client fingerprint, the free-tier request-body gate, and SSE stream hardening — no client-side changes required.
 
 ---
 
@@ -37,11 +37,19 @@ It provides transparent request passthrough, multi-instance concurrency, automat
    - No external third-party dependencies.
    - Compact binary (~7MB) with instant startup.
 
+7. **OpenCode zen Free-Tier Lane** (auto-detected on `opencode.ai` endpoints):
+   - **Header fingerprint**: stamps `User-Agent: opencode/1.18.31 …`, `X-Opencode-Client/Session/Request/Project`, and gateway-shaped `ses_…` / `msg_…` ids (bit-inverted, millisecond-monotonic). Client-supplied ids are preserved.
+   - **Body gate**: the free tier only answers requests that both stream *and* declare the lowercase tool quartet `bash`/`glob`/`grep`/`read`. This proxy forces `stream: true`, fills any missing quartet slot with a self-disabling decoy, and never lets the model call a decoy (`tool_choice: none` when the client declared no tools, `auto` otherwise).
+   - **Body hygiene**: `developer → system` role downgrade (the upstream rejects the developer role), numeric clamps (`max_tokens ≤ 131072`, `0 < top_p ≤ 1`, `0 ≤ temperature ≤ 2`), `reasoning_effort: max`.
+   - **Endpoint routing**: models served by `/responses` (muse-spark-*) or `/messages` (union-alpha) are re-routed automatically when the client calls `/chat/completions`.
+   - **SSE stream hardening**: an upstream that EOFs or stalls without a `finish_reason` gets a synthetic `bash echo 继续` tool call injected so the client's tool loop resumes instead of dying on a truncated stream.
+   - **Gate-error classification**: upstream `FreeTierError` / `FreeUsageLimitError` / `RegionError` / `ModelUnavailable` / `EndpointUnavailable` / `AuthError` responses are logged with an actionable hint and tagged on the `X-Opencode-Gate` response header.
+
 ---
 
 ## 📋 Configuration (`config.json`)
 
-The configuration file is a JSON array. Each object contains the **four required properties**:
+The configuration file is a JSON array. Each object contains the **four required properties** (plus an optional `provider`):
 
 ```json
 [
@@ -52,22 +60,10 @@ The configuration file is a JSON array. Each object contains the **four required
     "listen": "127.0.0.1:8001"
   },
   {
-    "endpoint": "https://token.sensenova.cn",
-    "Authkey": "sk-your-sensenova-api-key-2",
-    "engress": "eth0",
-    "listen": "127.0.0.1:8002"
-  },
-  {
-    "endpoint": "https://token.sensenova.cn",
-    "Authkey": "sk-your-sensenova-api-key-3",
-    "engress": "socks5://127.0.0.1:1080",
-    "listen": "127.0.0.1:8003"
-  },
-  {
-    "endpoint": "https://token.sensenova.cn",
-    "Authkey": "sk-your-sensenova-api-key-4",
-    "engress": "",
-    "listen": "127.0.0.1:8004"
+    "endpoint": "https://opencode.ai/zen/v1",
+    "Authkey": "public",
+    "engress": "192.168.1.102",
+    "listen": "127.0.0.1:8011"
   }
 ]
 ```
@@ -76,12 +72,13 @@ The configuration file is a JSON array. Each object contains the **four required
 
 | Field | Type | Description | Example |
 |---|---|---|---|
-| `endpoint` | string | Target upstream URL | `"https://token.sensenova.cn"` |
-| `Authkey` | string | SenseNova API Key (injected as `Authorization: Bearer <Authkey>`) | `"sk-abc123..."` |
+| `endpoint` | string | Target upstream URL | `"https://token.sensenova.cn"`, `"https://opencode.ai/zen/v1"` |
+| `Authkey` | string | API key injected as `Authorization: Bearer <Authkey>`. Defaults to `"public"` for the opencode lane. | `"sk-abc123..."`, `"public"` |
 | `engress` | string | Outbound egress IP, interface name, proxy URL, or empty | `"192.168.1.10"`, `"eth0"`, `"socks5://127.0.0.1:1080"` |
 | `listen` | string | Local listening IP and port | `"127.0.0.1:8001"`, `":8001"` |
+| `provider` | string | Optional. `sensenova` (default), `openai`, `opencode`, or `passthrough`. Auto-detected from the endpoint host when omitted — any `opencode.ai` endpoint runs the free-tier lane. | `"opencode"` |
 
-*Note: Field names are case-insensitive and support aliases (e.g. `Authkey` / `authkey`, `engress` / `egress`).*
+*Note: Field names are case-insensitive and support aliases (e.g. `Authkey` / `authkey`, `engress` / `egress`, `provider` / `mode` / `upstream_type`).*
 
 ---
 
@@ -125,12 +122,13 @@ Output:
   "engress": "192.168.1.101",
   "has_authkey": true,
   "listen": "127.0.0.1:8001",
+  "provider": "sensenova",
   "status": "ok",
   "time": "2026-09-20T06:04:52Z"
 }
 ```
 
-### Chat Completions (OpenAI Compatible)
+### Chat Completions (SenseNova)
 ```bash
 curl -X POST http://127.0.0.1:8001/v1/chat/completions \
   -H "Content-Type: application/json" \
@@ -138,6 +136,21 @@ curl -X POST http://127.0.0.1:8001/v1/chat/completions \
     "model": "SenseChat-5",
     "messages": [{"role": "user", "content": "Hello!"}],
     "stream": true
+  }'
+```
+
+### Chat Completions (OpenCode free tier)
+
+Point any OpenAI-compatible client at the opencode instance. The proxy handles
+the fingerprint and the body gate transparently — `stream` and `tools` do not
+need to be set by the client.
+
+```bash
+curl -N -X POST http://127.0.0.1:8011/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "nemotron-3.5-lightning-free",
+    "messages": [{"role": "user", "content": "Say hi"}]
   }'
 ```
 

@@ -1,14 +1,17 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -246,6 +249,29 @@ func BuildProxyHandler(item ProxyItem, tr *http.Transport) (http.Handler, error)
 			req.Header.Set("Authorization", authHeader)
 		}
 
+		// opencode lane: stamp the gateway fingerprint and enforce the body
+		// gate (stream:true + the bash/glob/grep/read quartet). Everything the
+		// upstream rejects would otherwise surface as a 403 FreeTierError with
+		// no hint as to why.
+		if item.IsOpencode() {
+			applyFingerprintHeaders(req)
+			newBody, model, _, err := rewriteOpencodeBody(req)
+			if err != nil {
+				log.Printf("[%s] opencode body rewrite failed, forwarding as-is: %v", item.Listen, err)
+			} else {
+				req.Body = io.NopCloser(bytes.NewReader(newBody))
+				req.ContentLength = int64(len(newBody))
+				req.Header.Set("Content-Length", strconv.Itoa(len(newBody)))
+				req.GetBody = func() (io.ReadCloser, error) {
+					return io.NopCloser(bytes.NewReader(newBody)), nil
+				}
+				// Some free models are only served by /responses or /messages.
+				if np := reRouteModelEndpoint(req, model); np != "" {
+					req.URL.Path = strings.TrimSuffix(req.URL.Path, "/chat/completions") + np
+				}
+			}
+		}
+
 		// Prevent upstream gzip/brotli buffering for streaming responses:
 		// Upstream gzip compressors buffer small SSE chunks in 4-32KB blocks, delaying token delivery.
 		// Forcing identity encoding ensures unbuffered real-time SSE token delivery.
@@ -275,6 +301,38 @@ func BuildProxyHandler(item ProxyItem, tr *http.Transport) (http.Handler, error)
 	// ModifyResponse strips all Cloudflare tracking headers, telemetry, and cookies,
 	// ensures anti-buffering headers, and injects CORS headers while passing all other upstream headers
 	proxy.ModifyResponse = func(resp *http.Response) error {
+		// opencode lane: harden SSE streams and classify gate errors.
+		if item.IsOpencode() {
+			switch {
+			case resp.StatusCode == http.StatusOK:
+				if ct := resp.Header.Get("Content-Type"); strings.Contains(ct, "text/event-stream") {
+					if resp.Body != nil {
+						// Recover the model name from the (rewritten) request body
+						// so a synthetic keepalive chunk carries the right tag.
+						model := ""
+						if gb := resp.Request.GetBody; gb != nil {
+							if bc, err := gb(); err == nil {
+								body, _ := io.ReadAll(bc)
+								var p map[string]any
+								if json.Unmarshal(body, &p) == nil {
+									model, _ = p["model"].(string)
+								}
+							}
+						}
+						resp.Body = newSSEPumpBody(resp.Body, model)
+					}
+				}
+			case resp.StatusCode >= 400:
+				// Classify the gate error and surface it to both the logs and the
+				// client, so a blocked egress IP or an exhausted session quota is
+				// diagnosable instead of showing up as an opaque 4xx.
+				if class, hint := classifyGateError(resp); class != "" {
+					resp.Header.Set("X-Opencode-Gate", class)
+					log.Printf("[%s -> %s] upstream %d %s: %s", item.Listen, item.Engress, resp.StatusCode, class, hint)
+				}
+			}
+		}
+
 		// Strip all Cloudflare-injected tracking headers from upstream response
 		for k, v := range resp.Header {
 			val := ""
@@ -329,10 +387,10 @@ func BuildProxyHandler(item ProxyItem, tr *http.Transport) (http.Handler, error)
 		rw.WriteHeader(http.StatusBadGateway)
 		_ = json.NewEncoder(rw).Encode(map[string]interface{}{
 			"error": map[string]interface{}{
-				"code":     "bad_gateway",
-				"message":  fmt.Sprintf("proxy failed to reach upstream '%s': %v", item.Endpoint, err),
-				"listen":   item.Listen,
-				"engress":  item.Engress,
+				"code":    "bad_gateway",
+				"message": fmt.Sprintf("proxy failed to reach upstream '%s': %v", item.Endpoint, err),
+				"listen":  item.Listen,
+				"engress": item.Engress,
 			},
 		})
 	}
@@ -350,6 +408,7 @@ func BuildProxyHandler(item ProxyItem, tr *http.Transport) (http.Handler, error)
 				"status":      "ok",
 				"listen":      item.Listen,
 				"endpoint":    item.Endpoint,
+				"provider":    item.Provider,
 				"engress":     item.Engress,
 				"has_authkey": item.AuthKey != "",
 				"time":        time.Now().Format(time.RFC3339),
