@@ -981,3 +981,55 @@ func gateHintClassifies(class []byte) string {
 	}
 	return ""
 }
+
+// ---------------------------------------------------------------------------
+// faked /v1/models response — custom model ids injected into the model list so
+// clients see them as available even when the upstream does not serve them.
+// ---------------------------------------------------------------------------
+
+// modelsResponse mirrors the OpenAI-style list body we receive from upstream.
+type modelsResponse struct {
+	Object string `json:"object"`
+	Data   []struct {
+		ID string `json:"id"`
+	} `json:"data"`
+}
+
+// rewriteModelsBody merges custom ids into (or outright replaces) the upstream
+// /v1/models list. mode is "append" (default) or "replace". On any parse
+// failure the original body is returned unchanged.
+func rewriteModelsBody(body []byte, custom []string, mode string) []byte {
+	if len(custom) == 0 {
+		return body
+	}
+	var resp modelsResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		log.Printf("opencode: cannot parse /v1/models body (%v), passing through", err)
+		return body
+	}
+
+	seen := make(map[string]bool, len(resp.Data)+len(custom))
+	if mode == "replace" {
+		resp.Data = nil
+	} else {
+		for _, m := range resp.Data {
+			seen[m.ID] = true
+		}
+	}
+	for _, id := range custom {
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		resp.Data = append(resp.Data, struct {
+			ID string `json:"id"`
+		}{ID: id})
+	}
+	resp.Object = "list"
+
+	out, err := json.Marshal(resp)
+	if err != nil {
+		return body
+	}
+	return out
+}

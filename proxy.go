@@ -304,6 +304,26 @@ func BuildProxyHandler(item ProxyItem, tr *http.Transport) (http.Handler, error)
 		// opencode lane: harden SSE streams and classify gate errors.
 		if item.IsOpencode() {
 			switch {
+			case resp.StatusCode == http.StatusOK && strings.HasSuffix(resp.Request.URL.Path, "/models"):
+				// Faked /v1/models: merge (or replace with) custom model ids so
+				// clients see them as available even when the upstream does not
+				// serve them.
+				if len(item.CustomModels) > 0 {
+					if ct := resp.Header.Get("Content-Type"); strings.Contains(ct, "application/json") {
+						if resp.Body != nil {
+							body, err := io.ReadAll(resp.Body)
+							resp.Body.Close()
+							if err == nil {
+								nb := rewriteModelsBody(body, item.CustomModels, item.ModelsMode)
+								resp.Body = io.NopCloser(bytes.NewReader(nb))
+								resp.ContentLength = int64(len(nb))
+								// The stale Content-Length no longer matches the
+								// rewritten body; let the transport re-chunk.
+								resp.Header.Del("Content-Length")
+							}
+						}
+					}
+				}
 			case resp.StatusCode == http.StatusOK:
 				if ct := resp.Header.Get("Content-Type"); strings.Contains(ct, "text/event-stream") {
 					if resp.Body != nil {

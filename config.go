@@ -17,12 +17,19 @@ import (
 //   - listen: local listening address (e.g. "127.0.0.1:8001" or ":8001")
 //   - provider (optional): sensenova | openai | opencode | passthrough.
 //     Auto-detected from the endpoint host when omitted (opencode.ai -> opencode).
+//   - custom_models (optional, opencode lane): extra model ids injected into
+//     the /v1/models response so clients see them as available (even if the
+//     upstream does not actually serve them).
+//   - models_mode (optional): "append" (default) merges custom_models into the
+//     upstream list; "replace" serves only custom_models.
 type ProxyItem struct {
-	Endpoint string `json:"endpoint"`
-	AuthKey  string `json:"Authkey"`
-	Engress  string `json:"engress"`
-	Listen   string `json:"listen"`
-	Provider string `json:"provider"`
+	Endpoint     string   `json:"endpoint"`
+	AuthKey      string   `json:"Authkey"`
+	Engress      string   `json:"engress"`
+	Listen       string   `json:"listen"`
+	Provider     string   `json:"provider"`
+	CustomModels []string `json:"custom_models"`
+	ModelsMode   string   `json:"models_mode"`
 
 	// Parsed upstream target URL
 	TargetURL *url.URL `json:"-"`
@@ -49,11 +56,44 @@ func (p *ProxyItem) UnmarshalJSON(data []byte) error {
 		return ""
 	}
 
+	getStrSlice := func(keys ...string) []string {
+		for _, k := range keys {
+			if v, ok := raw[k]; ok && v != nil {
+				switch val := v.(type) {
+				case []interface{}:
+					out := make([]string, 0, len(val))
+					for _, s := range val {
+						if str, ok := s.(string); ok && strings.TrimSpace(str) != "" {
+							out = append(out, strings.TrimSpace(str))
+						}
+					}
+					if len(out) > 0 {
+						return out
+					}
+				case string:
+					// tolerate a comma-separated inline list
+					var out []string
+					for _, part := range strings.Split(val, ",") {
+						if part = strings.TrimSpace(part); part != "" {
+							out = append(out, part)
+						}
+					}
+					if len(out) > 0 {
+						return out
+					}
+				}
+			}
+		}
+		return nil
+	}
+
 	p.Endpoint = getStr("endpoint", "Endpoint", "target", "upstream", "url")
 	p.AuthKey = getStr("Authkey", "authkey", "AuthKey", "auth_key", "apiKey", "api_key", "key", "token")
 	p.Engress = getStr("engress", "egress", "Engress", "Egress", "outbound", "source_ip", "interface")
 	p.Listen = getStr("listen", "Listen", "addr", "address", "bind", "port")
 	p.Provider = getStr("provider", "Provider", "mode", "upstream_type", "upstreamType", "protocol")
+	p.CustomModels = getStrSlice("custom_models", "customModels", "CustomModels", "fake_models", "extra_models")
+	p.ModelsMode = strings.ToLower(getStr("models_mode", "modelsMode", "mode_models", "model_list_mode"))
 
 	return nil
 }
@@ -99,6 +139,12 @@ func (p *ProxyItem) Validate(index int) error {
 	}
 	if p.Provider == "opencode" && p.AuthKey == "" {
 		p.AuthKey = opencodeDefaultKey
+	}
+	if p.ModelsMode == "" {
+		p.ModelsMode = "append"
+	}
+	if p.ModelsMode != "append" && p.ModelsMode != "replace" {
+		p.ModelsMode = "append"
 	}
 
 	// Listen address validation & normalization

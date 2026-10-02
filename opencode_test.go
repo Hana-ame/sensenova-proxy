@@ -587,3 +587,111 @@ func TestOpencodeHandlerGateHeader(t *testing.T) {
 		t.Fatalf("error body corrupted: %q", rec.Body.String())
 	}
 }
+
+// --- faked /v1/models ------------------------------------------------------
+
+func TestRewriteModelsBodyAppend(t *testing.T) {
+	orig := []byte(`{"object":"list","data":[{"id":"model-a"}]}`)
+	out := rewriteModelsBody(orig, []string{"dsv41f", "model-a"}, "append")
+	var resp modelsResponse
+	if err := json.Unmarshal(out, &resp); err != nil {
+		t.Fatalf("re-encode: %v", err)
+	}
+	ids := make(map[string]bool)
+	for _, m := range resp.Data {
+		ids[m.ID] = true
+	}
+	if len(ids) != 2 || !ids["model-a"] || !ids["dsv41f"] {
+		t.Fatalf("append failed: got %v", ids)
+	}
+}
+
+func TestRewriteModelsBodyReplace(t *testing.T) {
+	orig := []byte(`{"object":"list","data":[{"id":"model-a"}]}`)
+	out := rewriteModelsBody(orig, []string{"dsv41f"}, "replace")
+	var resp modelsResponse
+	_ = json.Unmarshal(out, &resp)
+	if len(resp.Data) != 1 || resp.Data[0].ID != "dsv41f" {
+		t.Fatalf("replace failed: %+v", resp)
+	}
+}
+
+func TestRewriteModelsBodyPassthrough(t *testing.T) {
+	// No custom models -> untouched.
+	orig := []byte(`{"object":"list","data":[{"id":"model-a"}]}`)
+	if out := rewriteModelsBody(orig, nil, "append"); !bytes.Equal(out, orig) {
+		t.Fatalf("nil custom should pass through: %s", out)
+	}
+	// Unparseable body -> untouched.
+	bad := []byte(`<html>not json</html>`)
+	if out := rewriteModelsBody(bad, []string{"dsv41f"}, "append"); !bytes.Equal(out, bad) {
+		t.Fatalf("unparseable body should pass through: %s", out)
+	}
+}
+
+func TestOpencodeHandlerModelsFake(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		rw.Header().Set("Content-Type", "application/json")
+		_, _ = rw.Write([]byte(`{"object":"list","data":[{"id":"nemotron-3.5-lightning-free"}]}`))
+	}))
+	defer upstream.Close()
+
+	item := ProxyItem{
+		Endpoint:     upstream.URL + "/v1",
+		Provider:     "opencode",
+		Listen:       "127.0.0.1:0",
+		CustomModels: []string{"dsv41f", "my-model"},
+		ModelsMode:   "append",
+	}
+	_ = item.Validate(0)
+	tr, _ := createTransport("")
+	handler, _ := BuildProxyHandler(item, tr)
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	var resp modelsResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("response not JSON: %v: %s", err, rec.Body.String())
+	}
+	ids := make(map[string]bool)
+	for _, m := range resp.Data {
+		ids[m.ID] = true
+	}
+	if !ids["dsv41f"] || !ids["my-model"] || !ids["nemotron-3.5-lightning-free"] {
+		t.Fatalf("custom models not injected: %v", ids)
+	}
+}
+
+func TestOpencodeHandlerModelsReplace(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		rw.Header().Set("Content-Type", "application/json")
+		_, _ = rw.Write([]byte(`{"object":"list","data":[{"id":"nemotron-3.5-lightning-free"}]}`))
+	}))
+	defer upstream.Close()
+
+	item := ProxyItem{
+		Endpoint:     upstream.URL + "/v1",
+		Provider:     "opencode",
+		Listen:       "127.0.0.1:0",
+		CustomModels: []string{"dsv41f"},
+		ModelsMode:   "replace",
+	}
+	_ = item.Validate(0)
+	tr, _ := createTransport("")
+	handler, _ := BuildProxyHandler(item, tr)
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	var resp modelsResponse
+	_ = json.Unmarshal(rec.Body.Bytes(), &resp)
+	if len(resp.Data) != 1 || resp.Data[0].ID != "dsv41f" {
+		t.Fatalf("replace mode failed: %+v", resp)
+	}
+}

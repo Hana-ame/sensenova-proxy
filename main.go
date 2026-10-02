@@ -7,7 +7,7 @@ import (
 	"os"
 )
 
-const version = "1.1.0"
+const version = "1.2.0"
 
 func main() {
 	configPathFlag := flag.String("config", "", "Path to JSON configuration file (default: config.json)")
