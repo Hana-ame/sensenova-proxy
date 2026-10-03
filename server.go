@@ -83,27 +83,21 @@ func (m *ProxyManager) Start() error {
 			egressDesc = "(default route)"
 		}
 
-		// 超时描述要区分三种情况：未配（走默认 90s）、显式关闭（负数）、
-		// 显式设置（含被 90s 钳过的）。只写 "none" 会让人以为完全不限制，
-		// 而实际默认是有上限的——这正是 2m03s 那批 502 的由来。
-		budget := item.waitBudget()
-		toDesc := fmt.Sprintf("timeout: %v", item.TimeoutDuration())
-		if item.TimeoutSecs == 0 {
-			toDesc += " (default " + budgetDesc(item.Provider) + ")"
-		} else if item.TimeoutSecs < 0 {
-			toDesc = "timeout: disabled"
-		} else if item.TimeoutSecs > budget.Seconds() {
-			toDesc += fmt.Sprintf(" (configured %.0fs clamped)", item.TimeoutSecs)
+		// 两段等待要分开说清楚，否则没法判断"慢请求会被不会砍断"：
+		//   total      —— 整个请求的总预算，**默认不限**，流会一直写到自然结束
+		//   first_byte —— 只管"还没收到任何字节"的阶段，默认 90s
+		// 也就是说：上游一旦开始吐字，无论多慢都不会被代理掐断。
+		toDesc := "timeout: none (stream runs to completion)"
+		if to := item.TimeoutDuration(); to > 0 {
+			toDesc = fmt.Sprintf("timeout: %v (explicit total budget)", to)
 		}
 
 		switch {
 		case item.FirstByteSecs < 0:
-			toDesc += ", first_byte: disabled"
+			toDesc += ", first_byte: disabled (will wait forever)"
 		case item.FirstByteSecs == 0:
-			toDesc += fmt.Sprintf(", first_byte: %v (default %s)", budget, budgetDesc(item.Provider))
-		case item.FirstByteSecs > budget.Seconds():
-			toDesc += fmt.Sprintf(", first_byte: %v (configured %.0fs clamped)",
-				budget, item.FirstByteSecs)
+			toDesc += fmt.Sprintf(", first_byte: %v (default, no-data guard)",
+				item.FirstByteDuration())
 		default:
 			toDesc += fmt.Sprintf(", first_byte: %v", item.FirstByteDuration())
 		}

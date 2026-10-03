@@ -115,23 +115,8 @@ func TestSessionFallbackModeNormalization(t *testing.T) {
 		}
 	}
 }
-
-// --- 90s 硬上限（防 Cloudflare 524）--------------------------------------
-
-func TestTimeoutClampedToHardCap(t *testing.T) {
-	// Cloudflare 默认 100s 拿不到源站首字节就断（524）。代理必须抢在它之前
-	// 收尾，所以无论配置写多大都钳到 90s。
-	p := ProxyItem{Provider: "opencode", TimeoutSecs: 600, FirstByteSecs: 300}
-	if got := p.TimeoutDuration(); got != maxWaitBudgetCF {
-		t.Errorf("TimeoutDuration = %v, want %v", got, maxWaitBudgetCF)
-	}
-	if got := p.FirstByteDuration(); got != maxWaitBudgetCF {
-		t.Errorf("FirstByteDuration = %v, want %v", got, maxWaitBudgetCF)
-	}
-}
-
 func TestTimeoutUnderCapUnchanged(t *testing.T) {
-	p := ProxyItem{TimeoutSecs: 45, FirstByteSecs: 20}
+	p := ProxyItem{Provider: "opencode", TimeoutSecs: 45, FirstByteSecs: 20}
 	if got := p.TimeoutDuration(); got != 45*time.Second {
 		t.Errorf("TimeoutDuration = %v, want 45s", got)
 	}

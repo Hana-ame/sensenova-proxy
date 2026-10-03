@@ -102,89 +102,42 @@ per-instance fields let the proxy set its own budget instead:
   "timeout": 120, "first_byte_timeout": 30 }
 ```
 
-**Omitting these is not "no limit".** v1.3.1–v1.3.3 treated `0` as unlimited and
-that is exactly what produced the `client_gone ... took=2m3s` log lines: the proxy
-sat waiting until the client gave up first, then could only record `502`.
-Defaults are now safe values. Use a **negative** value (`-1`) to genuinely
-disable one of them; any positive value is clamped to the instance's budget.
+**Two separate waits, with different defaults.** The proxy distinguishes
+"upstream has sent nothing yet" from "upstream is streaming":
 
-**The budget depends on whether Cloudflare is in front** — a single global limit
-is wrong, because the 100s ceiling is Cloudflare's, not the upstream's:
-
-| Instance | Default budget | Why |
+| Field | Bounds | Default |
 |---|---|---|
-| `provider: opencode` | **90s** | normally exposed through a Cloudflare tunnel. CF drops a connection without response headers after 100s and returns a bare `524`, so the proxy must finish first — 90s leaves 10s to deliver the `504`. |
-| everything else (direct) | **240s** | no CF in the path. Measured SenseNova latency: median 62.5s, max 193.9s, with 3 of 16 successful requests over 90s. A flat 90s cap would truncate 19% of perfectly good responses. |
+| `first_byte_timeout` | only the wait for the upstream's first byte | **90s** |
+| `timeout` | the whole request, streaming included | **unlimited** |
 
-The startup log says which tier each instance got:
-`timeout: 1m30s (default cloudflare)` vs `timeout: 4m0s (default direct)`.
+So the behaviour is: **if the upstream sends nothing for 90s the proxy gives up
+and returns `504`. Once the first byte arrives, the stream is never cut — it
+runs to completion no matter how long it takes.**
 
-**Hard cap: 90s.** Cloudflare drops a connection that has not produced response
-headers within 100s and returns a bare `524` — no error detail reaches the client
-and nothing shows up in the proxy log. The proxy therefore never waits longer
-than 90s for the upstream, whatever you configure, so its own `504` + JSON error
-arrives first. A configured value above the cap is clamped, and the startup log
-says so. If your workload genuinely needs longer, fix the client timeout or use a
-faster upstream — do not raise this ceiling.
+That asymmetry is deliberate. Measured SenseNova latency over 16 successful
+requests: median 62.5s, max 193.9s, with 3 requests over 90s. A flat total-time
+cap truncates 19% of perfectly good responses into broken streams, which is worse
+than being slow. What actually needs guarding against is an upstream that never
+sends a first byte — that is what `first_byte_timeout` is for, and it is also
+what prevents Cloudflare `524`s (CF drops a headerless connection after 100s and
+returns a bare error page).
 
-The failure mode is now explicit instead of ambiguous:
+Omitting a field is not "no limit" for `first_byte_timeout` — it is the 90s
+guard. Use a **negative** value (`-1`) to genuinely disable one. Positive values
+are clamped to 600s.
+
+The startup log spells out which is which:
+
+```
+timeout: none (stream runs to completion), first_byte: 1m30s (default, no-data guard)
+```
 
 | Situation | Status | `error.code` | Log line |
 |---|---|---|---|
-| Upstream exceeded `timeout` / `first_byte_timeout` | `504` | `upstream_timeout` | `upstream deadline exceeded (budget=...)` |
-| Client hung up while proxy was still waiting | `502` | `client_disconnected` | `client hung up before upstream answered (... not a proxy fault)` |
-| Proxy could not reach upstream at all | `502` | `bad_gateway` | `Upstream failure: ...` |
-
-That `client_disconnected` row is the one that used to be misread: a cluster of
-`502`s all landing on the same duration (e.g. `2m03s`) is the client's own timeout
-firing, not the proxy failing. Look at the client timeout — or set
-`first_byte_timeout` below it so the proxy answers first with an actionable `504`.
-
-### Session identity (v1.3.2+)
-
-The opencode gateway meters its free tier **per session**. v1.3.1 minted a fresh
-`ses_*` id on every request, which scattered one conversation across many
-sessions and split the quota. Now one conversation keeps one id:
-
-| Source of the id | Behaviour |
-|---|---|
-| Client sends `X-Session-Id` / `X-Opencode-Session` / `X-Session-Affinity` / `X-Conversation-Id` | used as-is (normalised to valid `ses_*` if it is not already) |
-| The header named by `session_header` | used as-is (same normalisation) |
-| Nothing sent, `session_fallback: client` (default) | derived from the client IP — stable for that client |
-| Nothing sent, `session_fallback: instance` | one fixed id for the whole instance |
-| Nothing sent, `session_fallback: request` | new id per request (old behaviour, splits quota) |
-
-Unsafe client values (spaces, newlines, non-ASCII) are hashed rather than
-forwarded, so a malformed header can never produce an invalid upstream request.
-
-### Log format (v1.3.2+)
-
-Every request carries a short `rid` that is repeated on all of its log lines,
-including the asynchronous SSE ones, so a single request can be reconstructed
-with `grep rid=3f9a2b1c`. The `listen` field is on every line, which matters when
-several instances run at once — previously the opencode lines carried no port at
-all, so you could not tell which lane produced them.
-
-```
-rid=3f9a2b1c listen=127.0.0.1:3000 model=big-pickle provider=opencode client=127.0.0.1 event=first_sse: waited=3.7s
-rid=3f9a2b1c listen=127.0.0.1:3000 model=big-pickle provider=opencode client=127.0.0.1 event=stream_done: took=7.4s saw_tool=false injected=false
-rid=3f9a2b1c listen=127.0.0.1:3000 model=big-pickle provider=opencode client=127.0.0.1 event=done: POST /v1/chat/completions -> 200 took=7.4s
-```
-
-| `event` | Meaning |
-|---|---|
-| `first_sse` | upstream sent its first SSE event (value is the wait) |
-| `stream_done` | stream finished; `saw_tool`/`injected` explain keepalive handling |
-| `keepalive_injected` | a synthetic tool call was appended to keep the stream alive |
-| `done` | final line: status code + total duration |
-| `upstream_timeout` | the proxy's own budget expired → `504` |
-| `client_gone` | client hung up first — explicitly *not* a proxy fault → `502` |
-| `gate_error` | upstream refused the free-tier request; `class` is in the `X-Opencode-Gate` response header |
-| `body_rewrite_failed` / `models_parse_failed` | request or `/v1/models` body was passed through untouched |
-| `stream_truncated` | the stream was cut **after** the 200 header went out, so the status code could not be changed. `cause` is `proxy_timeout_budget_expired` (retry) or `client_gone` (not your fault). This line is the only explanation the client ever gets. |
-
-Both `X-Proxy-RID` and `X-Proxy-Session` come back on the response (success and
-error alike), so a client can report the rid it saw.
+| No first byte within `first_byte_timeout` | `504` | `upstream_timeout` | `event=upstream_timeout: budget=1m30s ...` |
+| Client hung up while proxy was still waiting | `502` | `client_disconnected` | `event=client_gone: ... not a proxy fault` |
+| Stream cut after the 200 header went out | `200` (already sent) | — | `event=stream_truncated: cause=proxy_timeout_budget_expired` |
+| Proxy could not reach upstream at all | `502` | `bad_gateway` | `event=upstream_failure: err=...` |
 
 ### Multi-source aggregate (`sources`)
 
