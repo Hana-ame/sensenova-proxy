@@ -288,7 +288,12 @@ func (m *multiHandler) models(w http.ResponseWriter, r *http.Request) {
 		if u.inCooldown(time.Now()) {
 			continue
 		}
-		req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, u.base+"/v1/models", nil)
+		// 与 chat 同款路径归一：避免 /zen/v1 + /v1/models 双写。
+		modelsPath := u.base + "/v1/models"
+		if strings.HasSuffix(u.base, "/v1") {
+			modelsPath = u.base + "/models"
+		}
+		req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, modelsPath, nil)
 		if err != nil {
 			continue
 		}
@@ -433,7 +438,13 @@ func (m *multiHandler) trySource(w http.ResponseWriter, u *multiUpstream, r *htt
 // buildRequest 构造发往 opencode 源的请求，应用指纹 + 请求体门禁
 // （与单源 lane 同逻辑：stream:true、四件套、decoy、路径路由）。
 func (m *multiHandler) buildRequest(u *multiUpstream, method, path string, body []byte, head http.Header) (*http.Request, error) {
-	full := u.base + path
+	// 路径归一：base 已含 /zen/v1 时，客户端 /v1/... 不能拼成 /zen/v1/v1/...，
+	// 与单源 lane 的 Director 逻辑一致（去重 /v1）。
+	basePath := strings.TrimRight(u.base, "/")
+	if strings.HasSuffix(basePath, "/v1") && strings.HasPrefix(path, "/v1") {
+		basePath = strings.TrimSuffix(basePath, "/v1")
+	}
+	full := basePath + path
 	req, err := http.NewRequestWithContext(context.Background(), method, full, nil)
 	if err != nil {
 		return nil, err

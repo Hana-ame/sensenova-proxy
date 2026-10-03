@@ -173,3 +173,29 @@ func TestMultiAggregateModels(t *testing.T) {
 }
 
 var _ = io.Discard
+
+// 路径归一：base 含 /v1 时，客户端 /v1/chat/completions 不能拼成 /v1/v1。
+// 回归：live 测试曾暴露 real-opencode 拿到 /zen/v1/v1/chat/completions 404。
+func TestMultiBuildRequestPathNormalization(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"path":"` + r.URL.Path + `"}`))
+	}))
+	defer up.Close()
+
+	h, _ := buildMultiHandler([]openSource{{Name: "one", Endpoint: up.URL + "/zen/v1"}})
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"m","messages":[]}`))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	if strings.Contains(rec.Body.String(), "/v1/v1") {
+		t.Fatalf("path double /v1: %s", rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "/zen/v1/chat/completions") {
+		t.Fatalf("expected normalized path /zen/v1/chat/completions, got: %s", rec.Body.String())
+	}
+}
