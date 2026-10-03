@@ -42,6 +42,19 @@ type ProxyItem struct {
 	// 的长流。0 = 不限制。
 	FirstByteSecs float64 `json:"first_byte_timeout"`
 
+	// SessionHeader 指定从客户端请求的哪个 header 取会话标识（opencode lane）。
+	// 取到的值会作为 X-Session-Id / X-Session-Affinity / X-Opencode-Session
+	// 一起发给上游，使同一会话的多次请求命中同一个上游 session。
+	// 留空 = 走 SessionFallback 策略。
+	SessionHeader string `json:"session_header"`
+
+	// SessionFallback 决定客户端没带会话标识时怎么办：
+	//   "client"（默认）——按客户端 IP 派生，同一客户端会话内稳定
+	//   "instance"      ——整个实例共用一个固定值
+	//   "request"       ——每个请求一个新 session（旧行为，会把上游按 session
+	//                     计的免费配额切碎，一般别用）
+	SessionFallback string `json:"session_fallback"`
+
 	// Sources 多源聚合（"一拖多"）：非空时该实例为聚合模式——
 	// 客户端只配一个 baseURL，请求按序 failover 到这些 opencode 源
 	// （每源固定 endpoint + net 出口，遇 exceed 冷却到 UTC 午夜自动换源）。
@@ -128,6 +141,8 @@ func (p *ProxyItem) UnmarshalJSON(data []byte) error {
 	p.ModelsMode = strings.ToLower(getStr("models_mode", "modelsMode", "mode_models", "model_list_mode"))
 	p.TimeoutSecs = getNum("timeout", "Timeout", "timeout_sec", "timeout_secs", "upstream_timeout")
 	p.FirstByteSecs = getNum("first_byte_timeout", "firstByteTimeout", "first_byte", "header_timeout", "response_header_timeout")
+	p.SessionHeader = getStr("session_header", "sessionHeader", "SessionHeader", "session_id_header", "session_from")
+	p.SessionFallback = strings.ToLower(getStr("session_fallback", "sessionFallback", "session_fallback_mode"))
 
 	// sources: 多源聚合的源列表（每个源可带 name/endpoint/net/engress）
 	if v, ok := raw["sources"]; ok && v != nil {
@@ -162,12 +177,36 @@ func strAny(v interface{}) string {
 	return ""
 }
 
-// TimeoutDuration 返回上游总超时；0 表示不主动超时。
+// maxWaitBudget 是代理允许等上游的硬上限。
+//
+// Cloudflare 默认 100s 拿不到源站首字节就断连接并回 524 —— 客户端看到的是
+// 一个没有任何错误细节的 HTML 页面，代理侧日志里也什么都看不到（CF 早就
+// 把连接掐了）。所以代理必须抢在 CF 之前自己收尾：90s 上限留了 10s 余量，
+// 让 504 + JSON 错误能真正送到客户端。
+//
+// 无论配置写成多少，都会被钳到这个值。需要更长等待的场景（例如流式生成
+// 本来就慢）应该调客户端超时或换更快的上游，而不是放宽这个上限。
+const maxWaitBudget = 90 * time.Second
+
+// SessionFallbackMode 返回归一化后的会话回退策略，默认 "client"。
+func (p *ProxyItem) SessionFallbackMode() string {
+	switch p.SessionFallback {
+	case "instance", "fixed", "global":
+		return "instance"
+	case "request", "per_request", "new":
+		return "request"
+	default:
+		return "client"
+	}
+}
+
+// TimeoutDuration 返回上游总超时；0 表示不主动超时。超过 maxWaitBudget
+// 会被钳到上限，防止 Cloudflare 先掐断连接（524）。
 func (p *ProxyItem) TimeoutDuration() time.Duration {
 	if p.TimeoutSecs <= 0 {
 		return 0
 	}
-	return time.Duration(p.TimeoutSecs * float64(time.Second))
+	return clampBudget(time.Duration(p.TimeoutSecs * float64(time.Second)))
 }
 
 // FirstByteDuration 返回等待上游响应头的超时；0 表示不限制。
@@ -175,7 +214,16 @@ func (p *ProxyItem) FirstByteDuration() time.Duration {
 	if p.FirstByteSecs <= 0 {
 		return 0
 	}
-	return time.Duration(p.FirstByteSecs * float64(time.Second))
+	return clampBudget(time.Duration(p.FirstByteSecs * float64(time.Second)))
+}
+
+// clampBudget 把超出上限的等待预算压到 maxWaitBudget。首字节超时尤其需要：
+// 它就是防 Cloudflare 524 的那道闸，写大了等于没写。
+func clampBudget(d time.Duration) time.Duration {
+	if d > maxWaitBudget {
+		return maxWaitBudget
+	}
+	return d
 }
 
 // providerIsValid reports whether a normalized provider value is known.

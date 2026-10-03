@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -290,11 +289,15 @@ func BuildProxyHandler(item ProxyItem, tr *http.Transport) (http.Handler, error)
 		// upstream rejects would otherwise surface as a 403 FreeTierError with
 		// no hint as to why.
 		if item.IsOpencode() {
-			applyFingerprintHeaders(req)
+			meta := metaFrom(req.Context())
+			sess := resolveSessionMarker(item, req)
+			meta.sess = sess
+			applyFingerprintHeaders(req, sess)
 			newBody, model, _, err := rewriteOpencodeBody(req)
 			if err != nil {
-				log.Printf("[%s] opencode body rewrite failed, forwarding as-is: %v", item.Listen, err)
+				meta.logf("body_rewrite_failed", "err=%v (forwarding as-is)", err)
 			} else {
+				meta.model = model
 				req.Body = io.NopCloser(bytes.NewReader(newBody))
 				req.ContentLength = int64(len(newBody))
 				req.Header.Set("Content-Length", strconv.Itoa(len(newBody)))
@@ -350,7 +353,7 @@ func BuildProxyHandler(item ProxyItem, tr *http.Transport) (http.Handler, error)
 							body, err := io.ReadAll(resp.Body)
 							resp.Body.Close()
 							if err == nil {
-								nb := rewriteModelsBody(body, item.CustomModels, item.ModelsMode)
+								nb := rewriteModelsBody(body, item.CustomModels, item.ModelsMode, metaFrom(resp.Request.Context()))
 								resp.Body = io.NopCloser(bytes.NewReader(nb))
 								resp.ContentLength = int64(len(nb))
 								// The stale Content-Length no longer matches the
@@ -375,7 +378,7 @@ func BuildProxyHandler(item ProxyItem, tr *http.Transport) (http.Handler, error)
 								}
 							}
 						}
-						resp.Body = newSSEPumpBody(resp.Body, model)
+						resp.Body = newSSEPumpBody(resp.Body, model, metaFrom(resp.Request.Context()))
 					}
 				}
 			case resp.StatusCode >= 400:
@@ -384,7 +387,8 @@ func BuildProxyHandler(item ProxyItem, tr *http.Transport) (http.Handler, error)
 				// diagnosable instead of showing up as an opaque 4xx.
 				if class, hint := classifyGateError(resp); class != "" {
 					resp.Header.Set("X-Opencode-Gate", class)
-					log.Printf("[%s -> %s] upstream %d %s: %s", item.Listen, item.Engress, resp.StatusCode, class, hint)
+					metaFrom(resp.Request.Context()).logf("gate_error",
+						"upstream=%d class=%s hint=%q", resp.StatusCode, class, hint)
 				}
 			}
 		}
@@ -410,6 +414,15 @@ func BuildProxyHandler(item ProxyItem, tr *http.Transport) (http.Handler, error)
 				}
 				resp.Header.Add("Set-Cookie", cookie)
 			}
+		}
+
+		// 回显本次请求的 rid / session，客户端出问题时报一个 rid 就能在日志里
+		// 捞出全部相关行；session 也可见，便于确认同一会话确实命中了同一个
+		// 上游 session。
+		meta := metaFrom(resp.Request.Context())
+		resp.Header.Set("X-Proxy-RID", meta.rid)
+		if meta.sess != "" {
+			resp.Header.Set("X-Proxy-Session", meta.sess)
 		}
 
 		// Set anti-buffering hints for downstream clients / proxies
@@ -442,16 +455,16 @@ func BuildProxyHandler(item ProxyItem, tr *http.Transport) (http.Handler, error)
 		// 是客户端等不及先撤了、代理被动收尾。分开记，排错才不跑偏。
 		timedOut := isTimeoutErr(err)
 		clientGone := errors.Is(err, context.Canceled)
+		meta := metaFrom(req.Context())
 
 		switch {
 		case timedOut:
-			log.Printf("[%s -> egress:%s] upstream deadline exceeded (budget=%v): %v",
-				item.Listen, item.Engress, timeoutBudget(item), err)
+			meta.logf("upstream_timeout", "budget=%s err=%v (proxy gave up first; raise the budget or lower first_byte_timeout if this is too aggressive)",
+				timeoutBudget(item), err)
 		case clientGone:
-			log.Printf("[%s -> egress:%s] client hung up before upstream answered (proxy still waiting, not a proxy fault): %v",
-				item.Listen, item.Engress, err)
+			meta.logf("client_gone", "err=%v (client hung up while proxy was still waiting upstream - not a proxy fault)", err)
 		default:
-			log.Printf("[%s -> egress:%s] Upstream failure: %v", item.Listen, item.Engress, err)
+			meta.logf("upstream_failure", "err=%v", err)
 		}
 
 		status, code := http.StatusBadGateway, "bad_gateway"
@@ -466,6 +479,11 @@ func BuildProxyHandler(item ProxyItem, tr *http.Transport) (http.Handler, error)
 		}
 
 		setCORSHeaders(rw, req)
+		m := metaFrom(req.Context())
+		rw.Header().Set("X-Proxy-RID", m.rid)
+		if m.sess != "" {
+			rw.Header().Set("X-Proxy-Session", m.sess)
+		}
 		rw.Header().Set("Content-Type", "application/json; charset=utf-8")
 		rw.WriteHeader(status)
 		_ = json.NewEncoder(rw).Encode(map[string]interface{}{
@@ -481,6 +499,18 @@ func BuildProxyHandler(item ProxyItem, tr *http.Transport) (http.Handler, error)
 	// Wrap in top-level handler for logging, healthcheck, and OPTIONS preflight
 	handler := http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
 		start := time.Now()
+
+		// 每个请求一个 rid，贯穿本次请求产生的所有日志行（含 SSE pump 那些
+		// 异步打的）。多实例并行时，listen + rid 就能唯一定位一次请求。
+		clientIP, _, _ := net.SplitHostPort(req.RemoteAddr)
+		req = withReqMeta(req, &reqMeta{
+			rid:      newRID(),
+			listen:   item.Listen,
+			engress:  item.Engress,
+			provider: item.Provider,
+			clientIP: clientIP,
+		})
+		meta := metaFrom(req.Context())
 
 		// 1. Diagnostic / health check endpoint
 		if req.URL.Path == "/_health" || req.URL.Path == "/healthz" {
@@ -526,14 +556,7 @@ func BuildProxyHandler(item ProxyItem, tr *http.Transport) (http.Handler, error)
 		proxy.ServeHTTP(rec, req)
 
 		duration := time.Since(start)
-		log.Printf("[%s -> egress:%s] %s %s -> %d (%v)",
-			item.Listen,
-			item.Engress,
-			req.Method,
-			req.URL.Path,
-			rec.statusCode,
-			duration,
-		)
+		meta.logf("done", "%s %s -> %d took=%s", req.Method, req.URL.Path, rec.statusCode, round1(duration))
 	})
 
 	return handler, nil

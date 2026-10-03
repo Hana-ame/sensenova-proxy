@@ -81,6 +81,8 @@ The configuration file is a JSON array. Each object contains the **four required
 | `models_mode` | string | Optional. `append` (default) merges `custom_models` into the upstream list; `replace` serves only `custom_models`. | `"append"`, `"replace"` |
 | `timeout` | float | Optional (v1.3.1+). Total upstream budget in seconds — from request send to response end. `0`/omitted = no proxy-side limit (pre-v1.3.1 behaviour). | `120` |
 | `first_byte_timeout` | float | Optional (v1.3.1+). Seconds to wait for the upstream **response headers** ("first byte"). Only bounds queueing/connecting: once headers arrive the stream is no longer limited, so it never truncates a healthy long SSE stream. | `30` |
+| `session_header` | string | Optional (v1.3.2+). Name of the **client** request header to take the session id from. Its value is normalised to a valid `ses_*` id and forwarded as `X-Session-Id` / `X-Session-Affinity` / `X-Opencode-Session`, so every request of one conversation lands on the same upstream session (upstream free quota is per-session). | `"X-Session-Id"` |
+| `session_fallback` | string | Optional (v1.3.2+). What to do when the client sends no session header: `client` (default, stable per client IP), `instance` (one fixed value for the whole instance), `request` (new session per request — splits the upstream quota, avoid). | `"client"` |
 | `sources` | object[] | **Multi-source aggregate ("一拖多")** — when set, this instance becomes an aggregate endpoint: clients configure a single baseURL and the proxy tries sources in order, auto-failing over when one is exhausted (429 / `FreeUsageLimitError`) with cooldown until the next UTC midnight. Each source fixes its own egress: no client-side param needed. See below. | see below |
 
 ### Timeouts (v1.3.1+)
@@ -102,6 +104,14 @@ per-instance fields let the proxy set its own budget instead:
 
 Both are `0` (unlimited) when omitted, so existing configs behave exactly as before.
 
+**Hard cap: 90s.** Cloudflare drops a connection that has not produced response
+headers within 100s and returns a bare `524` — no error detail reaches the client
+and nothing shows up in the proxy log. The proxy therefore never waits longer
+than 90s for the upstream, whatever you configure, so its own `504` + JSON error
+arrives first. A configured value above the cap is clamped, and the startup log
+says so. If your workload genuinely needs longer, fix the client timeout or use a
+faster upstream — do not raise this ceiling.
+
 The failure mode is now explicit instead of ambiguous:
 
 | Situation | Status | `error.code` | Log line |
@@ -114,6 +124,51 @@ That `client_disconnected` row is the one that used to be misread: a cluster of
 `502`s all landing on the same duration (e.g. `2m03s`) is the client's own timeout
 firing, not the proxy failing. Look at the client timeout — or set
 `first_byte_timeout` below it so the proxy answers first with an actionable `504`.
+
+### Session identity (v1.3.2+)
+
+The opencode gateway meters its free tier **per session**. v1.3.1 minted a fresh
+`ses_*` id on every request, which scattered one conversation across many
+sessions and split the quota. Now one conversation keeps one id:
+
+| Source of the id | Behaviour |
+|---|---|
+| Client sends `X-Session-Id` / `X-Opencode-Session` / `X-Session-Affinity` / `X-Conversation-Id` | used as-is (normalised to valid `ses_*` if it is not already) |
+| The header named by `session_header` | used as-is (same normalisation) |
+| Nothing sent, `session_fallback: client` (default) | derived from the client IP — stable for that client |
+| Nothing sent, `session_fallback: instance` | one fixed id for the whole instance |
+| Nothing sent, `session_fallback: request` | new id per request (old behaviour, splits quota) |
+
+Unsafe client values (spaces, newlines, non-ASCII) are hashed rather than
+forwarded, so a malformed header can never produce an invalid upstream request.
+
+### Log format (v1.3.2+)
+
+Every request carries a short `rid` that is repeated on all of its log lines,
+including the asynchronous SSE ones, so a single request can be reconstructed
+with `grep rid=3f9a2b1c`. The `listen` field is on every line, which matters when
+several instances run at once — previously the opencode lines carried no port at
+all, so you could not tell which lane produced them.
+
+```
+rid=3f9a2b1c listen=127.0.0.1:3000 model=big-pickle provider=opencode client=127.0.0.1 event=first_sse: waited=3.7s
+rid=3f9a2b1c listen=127.0.0.1:3000 model=big-pickle provider=opencode client=127.0.0.1 event=stream_done: took=7.4s saw_tool=false injected=false
+rid=3f9a2b1c listen=127.0.0.1:3000 model=big-pickle provider=opencode client=127.0.0.1 event=done: POST /v1/chat/completions -> 200 took=7.4s
+```
+
+| `event` | Meaning |
+|---|---|
+| `first_sse` | upstream sent its first SSE event (value is the wait) |
+| `stream_done` | stream finished; `saw_tool`/`injected` explain keepalive handling |
+| `keepalive_injected` | a synthetic tool call was appended to keep the stream alive |
+| `done` | final line: status code + total duration |
+| `upstream_timeout` | the proxy's own budget expired → `504` |
+| `client_gone` | client hung up first — explicitly *not* a proxy fault → `502` |
+| `gate_error` | upstream refused the free-tier request; `class` is in the `X-Opencode-Gate` response header |
+| `body_rewrite_failed` / `models_parse_failed` | request or `/v1/models` body was passed through untouched |
+
+Both `X-Proxy-RID` and `X-Proxy-Session` come back on the response (success and
+error alike), so a client can report the rid it saw.
 
 ### Multi-source aggregate (`sources`)
 

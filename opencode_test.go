@@ -64,7 +64,7 @@ func TestSessionForSeedStable(t *testing.T) {
 
 func TestApplyFingerprintHeaders(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
-	applyFingerprintHeaders(req)
+	applyFingerprintHeaders(req, "ses_000000000000abcdefghijklmn")
 
 	ua := req.Header.Get("User-Agent")
 	if !strings.HasPrefix(ua, "opencode/") {
@@ -87,12 +87,12 @@ func TestApplyFingerprintHeaders(t *testing.T) {
 func TestApplyFingerprintHeadersPreservesClientUA(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
 	req.Header.Set("User-Agent", "opencode/1.18.30 desktop")
-	req.Header.Set("X-Opencode-Session", "ses_000000000000A1B2C3D4E5F6")
-	applyFingerprintHeaders(req)
+	req.Header.Set("X-Opencode-Session", "ses_000000000000abcdefghijklmn")
+	applyFingerprintHeaders(req, "ses_000000000000abcdefghijklmn")
 	if got := req.Header.Get("User-Agent"); got != "opencode/1.18.30 desktop" {
 		t.Fatalf("overwrote a genuine opencode UA: %q", got)
 	}
-	if got := req.Header.Get("X-Opencode-Session"); got != "ses_000000000000A1B2C3D4E5F6" {
+	if got := req.Header.Get("X-Opencode-Session"); got != "ses_000000000000abcdefghijklmn" {
 		t.Fatalf("overwrote a genuine session id: %q", got)
 	}
 }
@@ -592,7 +592,7 @@ func TestOpencodeHandlerGateHeader(t *testing.T) {
 
 func TestRewriteModelsBodyAppend(t *testing.T) {
 	orig := []byte(`{"object":"list","data":[{"id":"model-a"}]}`)
-	out := rewriteModelsBody(orig, []string{"dsv41f", "model-a"}, "append")
+	out := rewriteModelsBody(orig, []string{"dsv41f", "model-a"}, "append", &reqMeta{rid: "t"})
 	var resp modelsResponse
 	if err := json.Unmarshal(out, &resp); err != nil {
 		t.Fatalf("re-encode: %v", err)
@@ -608,7 +608,7 @@ func TestRewriteModelsBodyAppend(t *testing.T) {
 
 func TestRewriteModelsBodyReplace(t *testing.T) {
 	orig := []byte(`{"object":"list","data":[{"id":"model-a"}]}`)
-	out := rewriteModelsBody(orig, []string{"dsv41f"}, "replace")
+	out := rewriteModelsBody(orig, []string{"dsv41f"}, "replace", &reqMeta{rid: "t"})
 	var resp modelsResponse
 	_ = json.Unmarshal(out, &resp)
 	if len(resp.Data) != 1 || resp.Data[0].ID != "dsv41f" {
@@ -619,12 +619,12 @@ func TestRewriteModelsBodyReplace(t *testing.T) {
 func TestRewriteModelsBodyPassthrough(t *testing.T) {
 	// No custom models -> untouched.
 	orig := []byte(`{"object":"list","data":[{"id":"model-a"}]}`)
-	if out := rewriteModelsBody(orig, nil, "append"); !bytes.Equal(out, orig) {
+	if out := rewriteModelsBody(orig, nil, "append", &reqMeta{rid: "t"}); !bytes.Equal(out, orig) {
 		t.Fatalf("nil custom should pass through: %s", out)
 	}
 	// Unparseable body -> untouched.
 	bad := []byte(`<html>not json</html>`)
-	if out := rewriteModelsBody(bad, []string{"dsv41f"}, "append"); !bytes.Equal(out, bad) {
+	if out := rewriteModelsBody(bad, []string{"dsv41f"}, "append", &reqMeta{rid: "t"}); !bytes.Equal(out, bad) {
 		t.Fatalf("unparseable body should pass through: %s", out)
 	}
 }

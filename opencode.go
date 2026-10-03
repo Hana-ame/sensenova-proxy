@@ -10,7 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -111,6 +111,11 @@ func (item *ProxyItem) opencodeBase() string {
 // id minting — gateway-shaped ses_*/msg_* ids
 // ---------------------------------------------------------------------------
 
+// round1 把时长压到 0.1s 精度，日志里不用看 15 位小数。
+func round1(d time.Duration) time.Duration {
+	return d.Round(100 * time.Millisecond)
+}
+
 // base62 renders n in the gateway's base62 alphabet.
 func base62(n uint64) string {
 	if n == 0 {
@@ -205,9 +210,73 @@ func sha256digest(s string) []byte {
 // header fingerprint
 // ---------------------------------------------------------------------------
 
+// resolveSessionMarker 决定这次请求用哪个会话标识。
+//
+// 上游的免费配额是按 session 计的，所以这个值必须在同一会话内稳定——早先
+// 这里每请求调一次 mintSessionID()，等于把配额逐请求切碎，而且日志里
+// 每次都是不同的 ses_* 值，看着像随机噪声。优先级：
+//
+//  1. 客户端自带（X-Session-Id / X-Opencode-Session / X-Session-Affinity，
+//     或配置 session_header 指定的任意头）——原样沿用，这是最准的。
+//  2. session_fallback = client（默认）——按客户端 IP 派生，同一客户端稳定。
+//  3. session_fallback = instance——整个实例共用一个固定值。
+//  4. session_fallback = request——每请求新值（保留旧行为，一般不用）。
+func resolveSessionMarker(item ProxyItem, req *http.Request) string {
+	// 1) 客户端显式提供的
+	if item.SessionHeader != "" {
+		if v := strings.TrimSpace(req.Header.Get(item.SessionHeader)); v != "" {
+			return sanitizeSessionMarker(v)
+		}
+	}
+	for _, k := range []string{"X-Session-Id", "X-Opencode-Session", "X-Session-Affinity", "X-Conversation-Id"} {
+		if v := strings.TrimSpace(req.Header.Get(k)); v != "" {
+			return sanitizeSessionMarker(v)
+		}
+	}
+
+	// 2~4) 回退策略
+	switch item.SessionFallbackMode() {
+	case "instance":
+		return sessionForSeed("instance\x00" + item.Listen)
+	case "request":
+		return mintSessionID()
+	default: // "client"
+		ip, _, err := net.SplitHostPort(req.RemoteAddr)
+		if err != nil {
+			ip = req.RemoteAddr
+		}
+		return sessionForSeed(ip)
+	}
+}
+
+// sanitizeSessionMarker 把客户端给的值规整成上游认的 ses_* 形式，同时保留
+// 可读性：如果客户端已经给了合法的 ses_ 值就原样返回，否则哈希派生一个。
+// 直接透传任意字符可能被上游拒掉（换行、非 ASCII 都会让 header 非法），
+// 所以这里统一走一遍。
+func sanitizeSessionMarker(v string) string {
+	if strings.HasPrefix(v, "ses_") && len(v) > 4 && isSessionSafe(v[4:]) {
+		return v
+	}
+	return sessionForSeed("client\x00" + v)
+}
+
+// isSessionSafe 检查 ses_ 后面的部分是否只含上游允许的字符（base62 + 十六进制）。
+func isSessionSafe(s string) bool {
+	for _, c := range s {
+		if (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
 // applyFingerprintHeaders stamps the opencode client fingerprint onto an
 // outbound request. Values the client already supplied are preserved.
-func applyFingerprintHeaders(req *http.Request) {
+//
+// sess 是本次请求的稳定会话标识（由 resolveSessionMarker 决定），三个
+// session 头用同一个值，保证上游按 session 归并。
+func applyFingerprintHeaders(req *http.Request, sess string) {
 	if ua := req.Header.Get("User-Agent"); !strings.HasPrefix(ua, "opencode") {
 		req.Header.Set("User-Agent", opencodeUA)
 	}
@@ -219,11 +288,18 @@ func applyFingerprintHeaders(req *http.Request) {
 			req.Header.Set(k, v)
 		}
 	}
+	if sess == "" {
+		sess = mintSessionID()
+	}
 	setIfEmpty("X-Opencode-Client", opencodeClientTag)
 	setIfEmpty("X-Opencode-Project", opencodeProject)
-	setIfEmpty("X-Session-Id", "ses_proxy")
-	setIfEmpty("X-Session-Affinity", "ses_proxy")
-	setIfEmpty("X-Opencode-Session", mintSessionID())
+	// session 三个头必须**强制覆盖**，不能用 setIfEmpty：客户端可能带了非法值
+	//（含空格/换行/非 ASCII），透传上去会让上游拒绝，而这里恰恰是统一规整
+	// 成合法 ses_* 的地方。resolveSessionMarker 已经把客户端值清洗过了，
+	// 所以覆盖不会丢信息。
+	req.Header.Set("X-Session-Id", sess)
+	req.Header.Set("X-Session-Affinity", sess)
+	req.Header.Set("X-Opencode-Session", sess)
 	setIfEmpty("X-Opencode-Request", mintRequestID())
 	if req.Header.Get("Accept") == "" {
 		req.Header.Set("Accept", "text/event-stream")
@@ -497,6 +573,7 @@ type ssePumpBody struct {
 	out      chan pumpChunk
 	done     chan struct{}
 	model    string
+	meta     *reqMeta
 
 	pending []byte // leftover payload from an oversized chunk
 }
@@ -507,12 +584,17 @@ type pumpChunk struct {
 	err  error
 }
 
-func newSSEPumpBody(upstream io.ReadCloser, model string) *ssePumpBody {
+func newSSEPumpBody(upstream io.ReadCloser, model string, meta *reqMeta) *ssePumpBody {
+	if meta == nil {
+		meta = &reqMeta{rid: "-"}
+	}
+	meta.model = model
 	b := &ssePumpBody{
 		upstream: upstream,
 		out:      make(chan pumpChunk, 64),
 		done:     make(chan struct{}),
 		model:    model,
+		meta:     meta,
 	}
 	go b.pump()
 	return b
@@ -625,7 +707,7 @@ func (b *ssePumpBody) pump() {
 	// Pre-read: wait for the first complete real SSE event, or bail.
 	preEv, preRest, err := b.preRead(raw)
 	if err != nil {
-		log.Printf("opencode: pre-read failed: %v", err)
+		b.meta.logf("pre_read_failed", "err=%v", err)
 		send([]byte("data: [DONE]\n\n"))
 		sendEOF()
 		return
@@ -634,7 +716,7 @@ func (b *ssePumpBody) pump() {
 	if !send(append(append([]byte{}, preEv...), '\n', '\n')) {
 		return
 	}
-	log.Printf("opencode: first SSE event +%.1fs", time.Since(started).Seconds())
+	b.meta.logf("first_sse", "waited=%s", round1(time.Since(started)))
 
 	if hasContent(preEv) {
 		lastReal = time.Now()
@@ -703,7 +785,7 @@ loop:
 		case m, ok := <-raw:
 			if !ok || m.eof {
 				if m.err != nil && !finished {
-					log.Printf("opencode: upstream error mid-stream: %v", m.err)
+					b.meta.logf("midstream_error", "err=%v", m.err)
 				}
 				if !finished && !doneSent && !injected {
 					if !send(idleInject(b.model)) {
@@ -769,10 +851,9 @@ loop:
 	}
 
 	if injected {
-		log.Printf("opencode: injected keepalive tool call (model=%s)", b.model)
+		b.meta.logf("keepalive_injected", "note=synthetic tool call appended to keep the stream alive")
 	}
-	log.Printf("opencode: stream done in %.1fs saw_tool=%v injected=%v",
-		time.Since(started).Seconds(), sawTool, injected)
+	b.meta.logf("stream_done", "took=%s saw_tool=%v injected=%v", round1(time.Since(started)), sawTool, injected)
 }
 
 // preRead waits for the first complete real SSE event from raw, bounded by
@@ -998,13 +1079,13 @@ type modelsResponse struct {
 // rewriteModelsBody merges custom ids into (or outright replaces) the upstream
 // /v1/models list. mode is "append" (default) or "replace". On any parse
 // failure the original body is returned unchanged.
-func rewriteModelsBody(body []byte, custom []string, mode string) []byte {
+func rewriteModelsBody(body []byte, custom []string, mode string, meta *reqMeta) []byte {
 	if len(custom) == 0 {
 		return body
 	}
 	var resp modelsResponse
 	if err := json.Unmarshal(body, &resp); err != nil {
-		log.Printf("opencode: cannot parse /v1/models body (%v), passing through", err)
+		meta.logf("models_parse_failed", "err=%v (passing through)", err)
 		return body
 	}
 

@@ -90,9 +90,21 @@ func (m *ProxyManager) Start() error {
 		if fb := item.FirstByteDuration(); fb > 0 {
 			toDesc += fmt.Sprintf(", first_byte: %v", fb)
 		}
+		// 配置值被 90s 硬上限钳过就明说，否则用户以为自己设了 10 分钟。
+		if item.TimeoutSecs > maxWaitBudget.Seconds() {
+			toDesc += fmt.Sprintf(" (configured %.0fs clamped to %v)", item.TimeoutSecs, maxWaitBudget)
+		}
+		if item.FirstByteSecs > maxWaitBudget.Seconds() {
+			toDesc += fmt.Sprintf(" (first_byte configured %.0fs clamped to %v)", item.FirstByteSecs, maxWaitBudget)
+		}
 
-		log.Printf("🚀 [Instance #%d] Listening on http://%s -> %s [provider: %s, egress: %s, auth: %s, %s]",
-			i+1, item.Listen, item.Endpoint, item.Provider, egressDesc, maskKey(item.AuthKey), toDesc)
+		sessDesc := fmt.Sprintf("session: %s", item.SessionFallbackMode())
+		if item.SessionHeader != "" {
+			sessDesc += fmt.Sprintf(" (client header: %s)", item.SessionHeader)
+		}
+
+		log.Printf("🚀 [Instance #%d] Listening on http://%s -> %s [provider: %s, egress: %s, auth: %s, %s, %s]",
+			i+1, item.Listen, item.Endpoint, item.Provider, egressDesc, maskKey(item.AuthKey), toDesc, sessDesc)
 
 		wg.Add(1)
 		go func(s *http.Server, addr string) {
