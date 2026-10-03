@@ -249,20 +249,39 @@ func resolveSessionMarker(item ProxyItem, req *http.Request) string {
 	}
 }
 
-// sanitizeSessionMarker 把客户端给的值规整成上游认的 ses_* 形式，同时保留
-// 可读性：如果客户端已经给了合法的 ses_ 值就原样返回，否则哈希派生一个。
-// 直接透传任意字符可能被上游拒掉（换行、非 ASCII 都会让 header 非法），
-// 所以这里统一走一遍。
+// sanitizeSessionMarker 把客户端给的值规整成上游认的 ses_* 形式。
+//
+// 合法性要同时满足字符集**和长度**：只查字符集不够，实测 ses_ + 12 hex +
+// 15 个字母数字这种"看着对但多一个字符"的值会被上游回 403 FreeTierError，
+// 而日志里完全看不出哪里不合规。形状对不上就哈希派生一个，让客户端不管
+// 传什么都不影响可用性。
 func sanitizeSessionMarker(v string) string {
-	if strings.HasPrefix(v, "ses_") && len(v) > 4 && isSessionSafe(v[4:]) {
+	if isValidSessionMarker(v) {
 		return v
 	}
 	return sessionForSeed("client\x00" + v)
 }
 
-// isSessionSafe 检查 ses_ 后面的部分是否只含上游允许的字符（base62 + 十六进制）。
-func isSessionSafe(s string) bool {
-	for _, c := range s {
+// sessionMarkerBodyLen 是上游接受的 ses_ 尾段长度：12 位小写 hex + 14 位
+// base62/十六进制字符。
+const sessionMarkerBodyLen = 26
+
+// isValidSessionMarker 校验一个值是否与上游 session id 的形状完全一致：
+// ses_ 前缀 + 26 字符，其中前 12 个必须是小写十六进制。
+func isValidSessionMarker(v string) bool {
+	if !strings.HasPrefix(v, "ses_") || len(v) != 4+sessionMarkerBodyLen {
+		return false
+	}
+	body := v[4:]
+	for i := 0; i < 12; i++ {
+		c := body[i]
+		if (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') {
+			continue
+		}
+		return false
+	}
+	for i := 12; i < len(body); i++ {
+		c := body[i]
 		if (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') {
 			continue
 		}

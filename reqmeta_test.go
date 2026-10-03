@@ -221,3 +221,41 @@ func captureLog(buf *strings.Builder) func() {
 		log.SetPrefix(oldPrefix)
 	}
 }
+
+func TestSessionMarkerLengthIsEnforced(t *testing.T) {
+	// 实测教训：ses_ + 12 hex + 15 个字母数字（多一个字符）会被上游回
+	// 403 FreeTierError，而只查字符集的旧实现会把它原样透传。所以长度也
+	// 必须校验，长度不对就派生一个新的合法值。
+	tooLong := "ses_000000000000mytestsession01" // 27 字符尾段
+	if isValidSessionMarker(tooLong) {
+		t.Error("over-length session marker accepted as valid")
+	}
+	got := sanitizeSessionMarker(tooLong)
+	if got == tooLong {
+		t.Error("over-length value was forwarded unchanged")
+	}
+	if !isValidSessionMarker(got) {
+		t.Errorf("derived marker is still invalid: %q", got)
+	}
+}
+
+func TestSessionMarkerHexPrefixIsEnforced(t *testing.T) {
+	// 前 12 位必须是小写 hex，大写或非 hex 都要重派生。
+	bad := "ses_00000000000ZZZZZZZZZZZZZZ"
+	if isValidSessionMarker(bad) {
+		t.Error("non-hex prefix accepted as valid")
+	}
+	if got := sanitizeSessionMarker(bad); !isValidSessionMarker(got) {
+		t.Errorf("derived marker invalid: %q", got)
+	}
+}
+
+func TestSessionMarkerAcceptsWellFormedValue(t *testing.T) {
+	good := "ses_000000000000mytestsession0"
+	if !isValidSessionMarker(good) {
+		t.Fatalf("well-formed marker rejected: %q", good)
+	}
+	if got := sanitizeSessionMarker(good); got != good {
+		t.Errorf("well-formed marker was rewritten: %q", got)
+	}
+}
