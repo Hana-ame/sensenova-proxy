@@ -297,7 +297,7 @@ func (m *multiHandler) models(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			continue
 		}
-		applyFingerprintHeaders(req)
+		req.Header.Set("Accept", "application/json")
 		resp, err := u.tr.RoundTrip(req)
 		if err != nil {
 			continue
@@ -435,67 +435,36 @@ func (m *multiHandler) trySource(w http.ResponseWriter, u *multiUpstream, r *htt
 	}
 }
 
-// buildRequest 构造发往 opencode 源的请求，应用指纹 + 请求体门禁
-// （与单源 lane 同逻辑：stream:true、四件套、decoy、路径路由）。
+// buildRequest 构造发往源的请求：**纯透传**——body 与 header 原样转发，
+// 不下发指纹、不改写门禁（源本身是 sensenova-proxy / api-pack 等反代，
+// 指纹与免费层门禁由它处理，聚合层不重复做）。
+// 仅做路径拼接归一（base 已含 /v1 时不与客户端 /v1 双写）。
 func (m *multiHandler) buildRequest(u *multiUpstream, method, path string, body []byte, head http.Header) (*http.Request, error) {
-	// 路径归一：base 已含 /zen/v1 时，客户端 /v1/... 不能拼成 /zen/v1/v1/...，
-	// 与单源 lane 的 Director 逻辑一致（去重 /v1）。
 	basePath := strings.TrimRight(u.base, "/")
 	if strings.HasSuffix(basePath, "/v1") && strings.HasPrefix(path, "/v1") {
 		basePath = strings.TrimSuffix(basePath, "/v1")
 	}
 	full := basePath + path
-	req, err := http.NewRequestWithContext(context.Background(), method, full, nil)
+	req, err := http.NewRequestWithContext(context.Background(), method, full, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
-	// 复制客户端 header
+	// 原样透传客户端 header（含 Authorization、UA 等，不注入指纹）。
 	for k, vv := range head {
 		for _, v := range vv {
 			req.Header.Add(k, v)
 		}
 	}
-
-	// opencode 门禁：重写 body（指纹在 proxyhandler 的 Director 里做，这里
-	// 直接内联——multiUpstream 不是 httputil.ReverseProxy）。
 	if len(body) > 0 {
-		var payload map[string]any
-		if err := json.Unmarshal(body, &payload); err != nil {
-			return nil, fmt.Errorf("invalid JSON: %w", err)
-		}
-		model, _ := payload["model"].(string)
-		sanitizeRolesPublic(payload)
-		payload["stream"] = true
-		rawTools, _ := payload["tools"].([]any)
-		_, _ = ensureToolQuartetPublic(payload, rawTools)
-		rewritten, err := json.Marshal(payload)
-		if err != nil {
-			return nil, err
-		}
-		req.Body = io.NopCloser(bytes.NewReader(rewritten))
-		req.ContentLength = int64(len(rewritten))
-		req.Header.Set("Content-Length", fmt.Sprintf("%d", len(rewritten)))
+		req.ContentLength = int64(len(body))
 		req.GetBody = func() (io.ReadCloser, error) {
-			return io.NopCloser(bytes.NewReader(rewritten)), nil
-		}
-		// 端点路由：muse-spark -> /responses 等
-		if np := reRouteModelEndpoint(req, model); np != "" {
-			req.URL.Path = strings.TrimSuffix(req.URL.Path, "/chat/completions") + np
+			return io.NopCloser(bytes.NewReader(body)), nil
 		}
 	}
-	// 指纹
-	applyFingerprintHeaders(req)
-	req.Host = u.target.Host
 	return req, nil
 }
 
-// --- 小工具：与 opencode.go 的函数签名对齐（避免改单源代码） ---
-
-func sanitizeRolesPublic(payload map[string]any) { sanitizeRoles(payload) }
-func ensureToolQuartetPublic(p map[string]any, tools []any) ([]any, bool) {
-	return ensureToolQuartet(p, tools, false)
-}
-
+// mergeHeaders 把上游响应头并入客户端响应（透传侧不做任何改写）。
 func mergeHeaders(dst, src http.Header) {
 	for k, vv := range src {
 		for _, v := range vv {
