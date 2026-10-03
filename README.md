@@ -79,8 +79,8 @@ The configuration file is a JSON array. Each object contains the **four required
 | `provider` | string | Optional. `sensenova` (default), `openai`, `opencode`, or `passthrough`. Auto-detected from the endpoint host when omitted — any `opencode.ai` endpoint runs the free-tier lane. | `"opencode"` |
 | `custom_models` | string[] | Optional (opencode lane). Extra model ids injected into the `/v1/models` response so clients see them as available — useful for names the upstream does not actually serve (e.g. `"dsv41f"`). | `["dsv41f"]` |
 | `models_mode` | string | Optional. `append` (default) merges `custom_models` into the upstream list; `replace` serves only `custom_models`. | `"append"`, `"replace"` |
-| `timeout` | float | Optional (v1.3.1+). Total upstream budget in seconds — from request send to response end. Omitted = 90s default; negative = no proxy-side limit; positive values are clamped to 90s. | `90` |
-| `first_byte_timeout` | float | Optional (v1.3.1+). Seconds to wait for the upstream **response headers** ("first byte"). Only bounds queueing/connecting: once headers arrive the stream is no longer limited, so it never truncates a healthy long SSE stream. Omitted = 90s default; negative = unlimited. | `90` |
+| `timeout` | float | Optional (v1.3.1+). Total upstream budget in seconds — from request send to response end. Omitted = the instance default (90s cloudflare / 240s direct); negative = no proxy-side limit; positive values are clamped to that budget. | `90` / `240` |
+| `first_byte_timeout` | float | Optional (v1.3.1+). Seconds to wait for the upstream **response headers** ("first byte"). Only bounds queueing/connecting: once headers arrive the stream is no longer limited, so it never truncates a healthy long SSE stream. Omitted = the instance default (90s cloudflare / 240s direct); negative = unlimited. | `90` / `240` |
 | `session_header` | string | Optional (v1.3.2+). Name of the **client** request header to take the session id from. Its value is normalised to a valid `ses_*` id and forwarded as `X-Session-Id` / `X-Session-Affinity` / `X-Opencode-Session`, so every request of one conversation lands on the same upstream session (upstream free quota is per-session). | `"X-Session-Id"` |
 | `session_fallback` | string | Optional (v1.3.2+). What to do when the client sends no session header: `client` (default, stable per client IP), `instance` (one fixed value for the whole instance), `request` (new session per request — splits the upstream quota, avoid). | `"client"` |
 | `sources` | object[] | **Multi-source aggregate ("一拖多")** — when set, this instance becomes an aggregate endpoint: clients configure a single baseURL and the proxy tries sources in order, auto-failing over when one is exhausted (429 / `FreeUsageLimitError`) with cooldown until the next UTC midnight. Each source fixes its own egress: no client-side param needed. See below. | see below |
@@ -102,11 +102,22 @@ per-instance fields let the proxy set its own budget instead:
   "timeout": 120, "first_byte_timeout": 30 }
 ```
 
-**Both default to 90s when omitted.** Omitting them is *not* "no limit" — that
-was v1.3.1–v1.3.3 behaviour and it is exactly what produced the `client_gone ...
-took=2m3s` log lines: the proxy sat waiting until the client gave up first, then
-could only record `502`. Defaults must be safe values. Use a **negative** value
-(`-1`) to genuinely disable one of them; any positive value is clamped to 90s.
+**Omitting these is not "no limit".** v1.3.1–v1.3.3 treated `0` as unlimited and
+that is exactly what produced the `client_gone ... took=2m3s` log lines: the proxy
+sat waiting until the client gave up first, then could only record `502`.
+Defaults are now safe values. Use a **negative** value (`-1`) to genuinely
+disable one of them; any positive value is clamped to the instance's budget.
+
+**The budget depends on whether Cloudflare is in front** — a single global limit
+is wrong, because the 100s ceiling is Cloudflare's, not the upstream's:
+
+| Instance | Default budget | Why |
+|---|---|---|
+| `provider: opencode` | **90s** | normally exposed through a Cloudflare tunnel. CF drops a connection without response headers after 100s and returns a bare `524`, so the proxy must finish first — 90s leaves 10s to deliver the `504`. |
+| everything else (direct) | **240s** | no CF in the path. Measured SenseNova latency: median 62.5s, max 193.9s, with 3 of 16 successful requests over 90s. A flat 90s cap would truncate 19% of perfectly good responses. |
+
+The startup log says which tier each instance got:
+`timeout: 1m30s (default cloudflare)` vs `timeout: 4m0s (default direct)`.
 
 **Hard cap: 90s.** Cloudflare drops a connection that has not produced response
 headers within 100s and returns a bare `524` — no error detail reaches the client

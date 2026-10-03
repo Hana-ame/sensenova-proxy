@@ -86,12 +86,13 @@ func (m *ProxyManager) Start() error {
 		// 超时描述要区分三种情况：未配（走默认 90s）、显式关闭（负数）、
 		// 显式设置（含被 90s 钳过的）。只写 "none" 会让人以为完全不限制，
 		// 而实际默认是有上限的——这正是 2m03s 那批 502 的由来。
+		budget := item.waitBudget()
 		toDesc := fmt.Sprintf("timeout: %v", item.TimeoutDuration())
 		if item.TimeoutSecs == 0 {
-			toDesc += " (default)"
+			toDesc += " (default " + budgetDesc(item.Provider) + ")"
 		} else if item.TimeoutSecs < 0 {
 			toDesc = "timeout: disabled"
-		} else if item.TimeoutSecs > maxWaitBudget.Seconds() {
+		} else if item.TimeoutSecs > budget.Seconds() {
 			toDesc += fmt.Sprintf(" (configured %.0fs clamped)", item.TimeoutSecs)
 		}
 
@@ -99,10 +100,10 @@ func (m *ProxyManager) Start() error {
 		case item.FirstByteSecs < 0:
 			toDesc += ", first_byte: disabled"
 		case item.FirstByteSecs == 0:
-			toDesc += fmt.Sprintf(", first_byte: %v (default)", maxWaitBudget)
-		case item.FirstByteSecs > maxWaitBudget.Seconds():
+			toDesc += fmt.Sprintf(", first_byte: %v (default %s)", budget, budgetDesc(item.Provider))
+		case item.FirstByteSecs > budget.Seconds():
 			toDesc += fmt.Sprintf(", first_byte: %v (configured %.0fs clamped)",
-				maxWaitBudget, item.FirstByteSecs)
+				budget, item.FirstByteSecs)
 		default:
 			toDesc += fmt.Sprintf(", first_byte: %v", item.FirstByteDuration())
 		}

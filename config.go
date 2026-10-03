@@ -177,20 +177,33 @@ func strAny(v interface{}) string {
 	return ""
 }
 
-// maxWaitBudget 是代理允许等上游的硬上限，同时是**默认值**。
-//
-// Cloudflare 默认 100s 拿不到源站首字节就断连接并回 524 —— 客户端看到的是
-// 一个没有任何错误细节的 HTML 页面，代理侧日志里也什么都看不到（CF 早就
-// 把连接掐了）。所以代理必须抢在 CF 之前自己收尾：90s 上限留了 10s 余量，
-// 让 504 + JSON 错误能真正送到客户端。
-//
-// 无论配置写成多少，都会被钳到这个值。**没配也按这个值算**，不是"不配就不
-// 限制"：实测日志里那些 `client_gone ... took=2m3s` 就是没配任何超时的产物
-// —— 代理陪着等到客户端自己超时断开，只能被动记 502。默认值必须是安全值。
-//
-// 需要更长等待的场景应该调客户端超时或换更快的上游，而不是放宽这个上限。
-// 真要显式关掉，用 timeout: -1 / first_byte_timeout: -1（见下面两个方法）。
-const maxWaitBudget = 90 * time.Second
+// 等待预算分两档：是否被 Cloudflare 挡在前面，决定了上限该是多少。
+const (
+	// maxWaitBudgetCF 是暴露在 Cloudflare 后面的实例的等待上限。CF 默认 100s
+	// 拿不到源站响应头就掐连接回 524，客户端只看到没细节的 HTML。所以这类实例
+	// 必须在 100s 前自己收尾，留 10s 余量把 504 送出去。
+	maxWaitBudgetCF = 90 * time.Second
+
+	// maxWaitBudgetDirect 是直连上游（无 CF）的等待上限。实测 SenseNova 的
+	// 正常生成中位 62.5s、最长 193.9s，16 个成功请求里有 3 个超过 90s —— 用
+	// 90s 会砍掉 19% 的正常请求。所以直连场景用 240s：既挡住真正的挂死，
+	// 又不砍掉慢但正常的生成。
+	//
+	// 一刀切 90s 是错的：CF 的约束只属于被 CF 挡在前面的时候。
+	maxWaitBudgetDirect = 240 * time.Second
+)
+
+// defaultWaitBudget 返回该实例的等待上限：暴露在 CF 后面的走 90s（要在 CF
+// 掐断前收尾），直连的走 240s（上游本来就慢）。opencode lane 一律按 CF 处理
+// ——它的免费层网关经常排队，且实践中通常经 Cloudflare 隧道暴露。
+func defaultWaitBudget(provider string) time.Duration {
+	switch provider {
+	case "opencode":
+		return maxWaitBudgetCF
+	default:
+		return maxWaitBudgetDirect
+	}
+}
 
 // SessionFallbackMode 返回归一化后的会话回退策略，默认 "client"。
 func (p *ProxyItem) SessionFallbackMode() string {
@@ -206,39 +219,46 @@ func (p *ProxyItem) SessionFallbackMode() string {
 
 // TimeoutDuration 返回上游总超时。
 //
-//	未配置（0）-> maxWaitBudget（90s）：这是默认值，不是"不限制"
+//	未配置（0）-> 该实例的 waitBudget()：这是默认值，不是"不限制"
 //	负数       -> 0，显式关闭总超时（仍受 first_byte_timeout 约束）
-//	正数       -> 钳到 maxWaitBudget，防止 Cloudflare 先掐断连接（524）
+//	正数       -> 钳到 waitBudget()
 func (p *ProxyItem) TimeoutDuration() time.Duration {
 	if p.TimeoutSecs < 0 {
 		return 0
 	}
+	budget := p.waitBudget()
 	if p.TimeoutSecs == 0 {
-		return maxWaitBudget
+		return budget
 	}
-	return clampBudget(time.Duration(p.TimeoutSecs * float64(time.Second)))
+	return clampBudget(time.Duration(p.TimeoutSecs*float64(time.Second)), budget)
 }
 
 // FirstByteDuration 返回等待上游响应头的超时，语义同 TimeoutDuration：
-// 未配置走 maxWaitBudget 默认值，负数显式关闭，正数钳到上限。首字节超时是防
+// 未配置走 waitBudget() 默认值，负数显式关闭，正数钳到上限。首字节超时是防
 // Cloudflare 524 的主力闸——524 的成因就是"源站迟迟没有响应头"。
 func (p *ProxyItem) FirstByteDuration() time.Duration {
 	if p.FirstByteSecs < 0 {
 		return 0
 	}
+	budget := p.waitBudget()
 	if p.FirstByteSecs == 0 {
-		return maxWaitBudget
+		return budget
 	}
-	return clampBudget(time.Duration(p.FirstByteSecs * float64(time.Second)))
+	return clampBudget(time.Duration(p.FirstByteSecs*float64(time.Second)), budget)
 }
 
-// clampBudget 把超出上限的等待预算压到 maxWaitBudget。首字节超时尤其需要：
+// clampBudget 把超出该实例预算的等待压到预算值。首字节超时尤其需要：
 // 它就是防 Cloudflare 524 的那道闸，写大了等于没写。
-func clampBudget(d time.Duration) time.Duration {
-	if d > maxWaitBudget {
-		return maxWaitBudget
+func clampBudget(d, budget time.Duration) time.Duration {
+	if d > budget {
+		return budget
 	}
 	return d
+}
+
+// waitBudget 返回本实例的等待上限。
+func (p *ProxyItem) waitBudget() time.Duration {
+	return defaultWaitBudget(p.Provider)
 }
 
 // providerIsValid reports whether a normalized provider value is known.
@@ -371,4 +391,13 @@ func LoadConfig(path string) ([]ProxyItem, error) {
 	}
 
 	return items, nil
+}
+
+// budgetDesc 说明该实例用哪一档预算，让启动日志一眼看出为什么是这个值：
+// cloudflare 档要抢在 CF 掐断连接前收尾，direct 档按直连上游的实际速度。
+func budgetDesc(provider string) string {
+	if provider == "opencode" {
+		return "cloudflare"
+	}
+	return "direct"
 }

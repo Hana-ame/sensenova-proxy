@@ -121,12 +121,12 @@ func TestSessionFallbackModeNormalization(t *testing.T) {
 func TestTimeoutClampedToHardCap(t *testing.T) {
 	// Cloudflare 默认 100s 拿不到源站首字节就断（524）。代理必须抢在它之前
 	// 收尾，所以无论配置写多大都钳到 90s。
-	p := ProxyItem{TimeoutSecs: 600, FirstByteSecs: 300}
-	if got := p.TimeoutDuration(); got != maxWaitBudget {
-		t.Errorf("TimeoutDuration = %v, want %v", got, maxWaitBudget)
+	p := ProxyItem{Provider: "opencode", TimeoutSecs: 600, FirstByteSecs: 300}
+	if got := p.TimeoutDuration(); got != maxWaitBudgetCF {
+		t.Errorf("TimeoutDuration = %v, want %v", got, maxWaitBudgetCF)
 	}
-	if got := p.FirstByteDuration(); got != maxWaitBudget {
-		t.Errorf("FirstByteDuration = %v, want %v", got, maxWaitBudget)
+	if got := p.FirstByteDuration(); got != maxWaitBudgetCF {
+		t.Errorf("FirstByteDuration = %v, want %v", got, maxWaitBudgetCF)
 	}
 }
 
@@ -142,8 +142,8 @@ func TestTimeoutUnderCapUnchanged(t *testing.T) {
 
 func TestHardCapLeavesRoomForCloudflare(t *testing.T) {
 	// 上限必须严格小于 Cloudflare 的 100s，否则 504 永远送不出去。
-	if maxWaitBudget >= 100*time.Second {
-		t.Fatalf("maxWaitBudget = %v, must stay below Cloudflare's 100s", maxWaitBudget)
+	if maxWaitBudgetCF >= 100*time.Second {
+		t.Fatalf("maxWaitBudgetCF = %v, must stay below Cloudflare's 100s", maxWaitBudgetCF)
 	}
 }
 

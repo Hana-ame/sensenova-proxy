@@ -48,12 +48,18 @@ func TestTimeoutConfigParsing(t *testing.T) {
 func TestTimeoutDurationHelpers(t *testing.T) {
 	// 未配置走 90s 默认值，而不是"不限制"——这正是 v1.3.1/1.3.2/1.3.3 那些
 	// `client_gone ... took=2m3s` 的根因：没配就一直陪客户端等到它自己断开。
-	unset := ProxyItem{}
-	if got := unset.TimeoutDuration(); got != maxWaitBudget {
-		t.Errorf("unset TimeoutDuration = %v, want default %v", got, maxWaitBudget)
+	unset := ProxyItem{Provider: "opencode"}
+	if got := unset.TimeoutDuration(); got != maxWaitBudgetCF {
+		t.Errorf("unset TimeoutDuration = %v, want default %v", got, maxWaitBudgetCF)
 	}
-	if got := unset.FirstByteDuration(); got != maxWaitBudget {
-		t.Errorf("unset FirstByteDuration = %v, want default %v", got, maxWaitBudget)
+	if got := unset.FirstByteDuration(); got != maxWaitBudgetCF {
+		t.Errorf("unset FirstByteDuration = %v, want default %v", got, maxWaitBudgetCF)
+	}
+	// 直连上游走另一档：实测 SenseNova 正常生成中位 62.5s、最长 193.9s，
+	// 90s 会砍掉 19% 的成功请求。
+	direct := ProxyItem{Provider: "sensenova"}
+	if got := direct.TimeoutDuration(); got != maxWaitBudgetDirect {
+		t.Errorf("direct TimeoutDuration = %v, want %v", got, maxWaitBudgetDirect)
 	}
 	// 负数是显式关闭。
 	off := ProxyItem{TimeoutSecs: -1, FirstByteSecs: -1}
@@ -73,15 +79,49 @@ func TestTimeoutDurationHelpers(t *testing.T) {
 	}
 }
 
-// 回归：v1.3.3 及之前"不配 = 不限制"，导致代理会等超过 Cloudflare 的 100s
-// 而让 CF 先掐连接（524）。未配置也必须有上限。
-func TestUnsetTimeoutStillBoundedBelowCloudflare(t *testing.T) {
-	p := ProxyItem{}
+// 回归：v1.3.3 及之前"不配 = 不限制"，代理会一直陪到客户端超时断开才记 502。
+// 未配置必须有上限。
+func TestUnsetTimeoutIsAlwaysBounded(t *testing.T) {
+	for _, prov := range []string{"", "opencode", "sensenova", "passthrough", "openai"} {
+		p := ProxyItem{Provider: prov}
+		if p.TimeoutDuration() <= 0 {
+			t.Errorf("provider %q: unset TimeoutDuration = %v, want a positive bound", prov, p.TimeoutDuration())
+		}
+		if p.FirstByteDuration() <= 0 {
+			t.Errorf("provider %q: unset FirstByteDuration = %v, want a positive bound", prov, p.FirstByteDuration())
+		}
+	}
+}
+
+// 回归：暴露在 CF 后面的实例必须抢在 Cloudflare 的 100s 前收尾，否则就是 524。
+func TestCloudflareBudgetStaysUnder100s(t *testing.T) {
+	p := ProxyItem{Provider: "opencode"}
 	if p.TimeoutDuration() >= 100*time.Second {
-		t.Errorf("unset TimeoutDuration = %v, must stay under Cloudflare's 100s", p.TimeoutDuration())
+		t.Errorf("opencode TimeoutDuration = %v, must stay under Cloudflare's 100s", p.TimeoutDuration())
 	}
 	if p.FirstByteDuration() >= 100*time.Second {
-		t.Errorf("unset FirstByteDuration = %v, must stay under Cloudflare's 100s", p.FirstByteDuration())
+		t.Errorf("opencode FirstByteDuration = %v, must stay under Cloudflare's 100s", p.FirstByteDuration())
+	}
+}
+
+// 一刀切 90s 会砍掉 19% 的 SenseNova 正常请求（实测 16 个成功请求里 3 个
+// 超过 90s，最长 193.9s）。直连实例的上限必须容得下它们。
+func TestDirectBudgetCoversObservedSenseNovaLatency(t *testing.T) {
+	if maxWaitBudgetDirect <= 194*time.Second {
+		t.Errorf("direct budget = %v, must exceed the slowest observed SenseNova success (193.9s)",
+			maxWaitBudgetDirect)
+	}
+}
+
+func TestBudgetClampPerProvider(t *testing.T) {
+	// 配一个超过该实例预算的值，应被钳到该实例的预算而不是全局最大值。
+	oc := ProxyItem{Provider: "opencode", TimeoutSecs: 600}
+	if got := oc.TimeoutDuration(); got != maxWaitBudgetCF {
+		t.Errorf("opencode clamped = %v, want %v", got, maxWaitBudgetCF)
+	}
+	sn := ProxyItem{Provider: "sensenova", TimeoutSecs: 600}
+	if got := sn.TimeoutDuration(); got != maxWaitBudgetDirect {
+		t.Errorf("sensenova clamped = %v, want %v", got, maxWaitBudgetDirect)
 	}
 }
 
