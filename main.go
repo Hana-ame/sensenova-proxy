@@ -7,7 +7,9 @@ import (
 	"os"
 )
 
-const version = "1.2.0"
+// version 必须跟随 tag 一起 bump：v1.3.0 发布时忘了改，导致 `sensenova-proxy -v`
+// 打成 v1.2.0，排查时误以为下错了包。
+const version = "1.3.1"
 
 func main() {
 	configPathFlag := flag.String("config", "", "Path to JSON configuration file (default: config.json)")

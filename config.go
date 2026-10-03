@@ -7,6 +7,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // ProxyItem defines a single proxy mapping instance.
@@ -30,6 +31,16 @@ type ProxyItem struct {
 	Provider     string   `json:"provider"`
 	CustomModels []string `json:"custom_models"`
 	ModelsMode   string   `json:"models_mode"`
+
+	// TimeoutSecs 上游总超时（秒）：从请求发出到响应结束的整段时间。
+	// 0 = 不主动超时（保留 v1.3.0 及之前的行为，只受 http.Server 的
+	// ReadTimeout/WriteTimeout 约束）。
+	TimeoutSecs float64 `json:"timeout"`
+
+	// FirstByteSecs 等上游响应头的超时（秒），即"首字节"超时。流式响应一旦
+	// 拿到响应头就不再受它约束，所以它只治"上游排队/连不上"，不会截断正常
+	// 的长流。0 = 不限制。
+	FirstByteSecs float64 `json:"first_byte_timeout"`
 
 	// Sources 多源聚合（"一拖多"）：非空时该实例为聚合模式——
 	// 客户端只配一个 baseURL，请求按序 failover 到这些 opencode 源
@@ -92,6 +103,22 @@ func (p *ProxyItem) UnmarshalJSON(data []byte) error {
 		return nil
 	}
 
+	getNum := func(keys ...string) float64 {
+		for _, k := range keys {
+			if v, ok := raw[k]; ok && v != nil {
+				switch val := v.(type) {
+				case float64:
+					return val
+				case string:
+					if f, err := strconv.ParseFloat(strings.TrimSpace(val), 64); err == nil {
+						return f
+					}
+				}
+			}
+		}
+		return 0
+	}
+
 	p.Endpoint = getStr("endpoint", "Endpoint", "target", "upstream", "url")
 	p.AuthKey = getStr("Authkey", "authkey", "AuthKey", "auth_key", "apiKey", "api_key", "key", "token")
 	p.Engress = getStr("engress", "egress", "Engress", "Egress", "outbound", "source_ip", "interface")
@@ -99,6 +126,8 @@ func (p *ProxyItem) UnmarshalJSON(data []byte) error {
 	p.Provider = getStr("provider", "Provider", "mode", "upstream_type", "upstreamType", "protocol")
 	p.CustomModels = getStrSlice("custom_models", "customModels", "CustomModels", "fake_models", "extra_models")
 	p.ModelsMode = strings.ToLower(getStr("models_mode", "modelsMode", "mode_models", "model_list_mode"))
+	p.TimeoutSecs = getNum("timeout", "Timeout", "timeout_sec", "timeout_secs", "upstream_timeout")
+	p.FirstByteSecs = getNum("first_byte_timeout", "firstByteTimeout", "first_byte", "header_timeout", "response_header_timeout")
 
 	// sources: 多源聚合的源列表（每个源可带 name/endpoint/net/engress）
 	if v, ok := raw["sources"]; ok && v != nil {
@@ -131,6 +160,22 @@ func strAny(v interface{}) string {
 		return strings.TrimSpace(s)
 	}
 	return ""
+}
+
+// TimeoutDuration 返回上游总超时；0 表示不主动超时。
+func (p *ProxyItem) TimeoutDuration() time.Duration {
+	if p.TimeoutSecs <= 0 {
+		return 0
+	}
+	return time.Duration(p.TimeoutSecs * float64(time.Second))
+}
+
+// FirstByteDuration 返回等待上游响应头的超时；0 表示不限制。
+func (p *ProxyItem) FirstByteDuration() time.Duration {
+	if p.FirstByteSecs <= 0 {
+		return 0
+	}
+	return time.Duration(p.FirstByteSecs * float64(time.Second))
 }
 
 // providerIsValid reports whether a normalized provider value is known.
@@ -180,6 +225,13 @@ func (p *ProxyItem) Validate(index int) error {
 	}
 	if p.ModelsMode != "append" && p.ModelsMode != "replace" {
 		p.ModelsMode = "append"
+	}
+	// 负超时没有意义，归零即"不限制"
+	if p.TimeoutSecs < 0 {
+		p.TimeoutSecs = 0
+	}
+	if p.FirstByteSecs < 0 {
+		p.FirstByteSecs = 0
 	}
 
 	// Listen address validation & normalization

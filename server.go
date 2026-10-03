@@ -83,8 +83,16 @@ func (m *ProxyManager) Start() error {
 			egressDesc = "(default route)"
 		}
 
-		log.Printf("🚀 [Instance #%d] Listening on http://%s -> %s [provider: %s, egress: %s, auth: %s]",
-			i+1, item.Listen, item.Endpoint, item.Provider, egressDesc, maskKey(item.AuthKey))
+		toDesc := "timeout: none"
+		if to := item.TimeoutDuration(); to > 0 {
+			toDesc = fmt.Sprintf("timeout: %v", to)
+		}
+		if fb := item.FirstByteDuration(); fb > 0 {
+			toDesc += fmt.Sprintf(", first_byte: %v", fb)
+		}
+
+		log.Printf("🚀 [Instance #%d] Listening on http://%s -> %s [provider: %s, egress: %s, auth: %s, %s]",
+			i+1, item.Listen, item.Endpoint, item.Provider, egressDesc, maskKey(item.AuthKey), toDesc)
 
 		wg.Add(1)
 		go func(s *http.Server, addr string) {

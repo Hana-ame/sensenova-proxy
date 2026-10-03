@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -143,6 +144,34 @@ func setCORSHeaders(rw http.ResponseWriter, req *http.Request) {
 	rw.Header().Set("Cross-Origin-Resource-Policy", "cross-origin")
 }
 
+// timeoutBudget 返回这次超时实际生效的预算，用于日志与错误提示。
+// 总超时优先；只配了首字节超时时报告首字节预算，避免日志里打出无意义的 0s。
+func timeoutBudget(p ProxyItem) time.Duration {
+	if to := p.TimeoutDuration(); to > 0 {
+		return to
+	}
+	return p.FirstByteDuration()
+}
+
+// isTimeoutErr 统一判定"是不是超时"。三种来源都要认：
+//  1. 自己用 context.WithTimeout 包的总超时 -> context.DeadlineExceeded
+//  2. Transport.ResponseHeaderTimeout（首字节超时）-> net/http 内部错误，
+//     既不是 DeadlineExceeded 也常被包成 *url.Error，只能看 Timeout()/文本
+//  3. 底层拨号/TLS 超时 -> net.Error.Timeout()
+func isTimeoutErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var ne net.Error
+	if errors.As(err, &ne) && ne.Timeout() {
+		return true
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "timeout awaiting response headers")
+}
+
 // isCloudflareHeader checks if an HTTP header is injected by Cloudflare for tracking, CDN telemetry, or identification.
 func isCloudflareHeader(name, val string) bool {
 	lowerName := strings.ToLower(name)
@@ -213,6 +242,13 @@ func (rec *responseRecorder) Unwrap() http.ResponseWriter {
 
 // BuildProxyHandler constructs the HTTP handler for a specific ProxyItem.
 func BuildProxyHandler(item ProxyItem, tr *http.Transport) (http.Handler, error) {
+	// 首字节超时只约束"等上游响应头"这一段。流式响应一旦拿到响应头就不再受
+	// 它约束，所以它治的是上游排队/连不上（日志里那种"生成 1.4s 却总共
+	// 30.9s"），不会截断正常进行中的长流。
+	if fb := item.FirstByteDuration(); fb > 0 {
+		tr.ResponseHeaderTimeout = fb
+	}
+
 	proxy := &httputil.ReverseProxy{
 		Transport:     tr,
 		FlushInterval: -1, // Immediate flushing for SSE / streaming responses
@@ -401,14 +437,41 @@ func BuildProxyHandler(item ProxyItem, tr *http.Transport) (http.Handler, error)
 
 	// ErrorHandler provides clear JSON errors on network failures
 	proxy.ErrorHandler = func(rw http.ResponseWriter, req *http.Request, err error) {
-		log.Printf("[%s -> egress:%s] Upstream failure: %v", item.Listen, item.Engress, err)
+		// 区分"上游超时"与"客户端自己断开"。两者以前都记成
+		// `Upstream failure: context canceled` + 502，看着像代理故障，实际常常
+		// 是客户端等不及先撤了、代理被动收尾。分开记，排错才不跑偏。
+		timedOut := isTimeoutErr(err)
+		clientGone := errors.Is(err, context.Canceled)
+
+		switch {
+		case timedOut:
+			log.Printf("[%s -> egress:%s] upstream deadline exceeded (budget=%v): %v",
+				item.Listen, item.Engress, timeoutBudget(item), err)
+		case clientGone:
+			log.Printf("[%s -> egress:%s] client hung up before upstream answered (proxy still waiting, not a proxy fault): %v",
+				item.Listen, item.Engress, err)
+		default:
+			log.Printf("[%s -> egress:%s] Upstream failure: %v", item.Listen, item.Engress, err)
+		}
+
+		status, code := http.StatusBadGateway, "bad_gateway"
+		hint := fmt.Sprintf("proxy failed to reach upstream '%s': %v", item.Endpoint, err)
+		switch {
+		case timedOut:
+			status, code = http.StatusGatewayTimeout, "upstream_timeout"
+			hint = fmt.Sprintf("upstream '%s' did not finish within %v (timeout budget)", item.Endpoint, timeoutBudget(item))
+		case clientGone:
+			code = "client_disconnected"
+			hint = fmt.Sprintf("client disconnected before upstream '%s' replied; raise the client timeout or lower first_byte_timeout", item.Endpoint)
+		}
+
 		setCORSHeaders(rw, req)
 		rw.Header().Set("Content-Type", "application/json; charset=utf-8")
-		rw.WriteHeader(http.StatusBadGateway)
+		rw.WriteHeader(status)
 		_ = json.NewEncoder(rw).Encode(map[string]interface{}{
 			"error": map[string]interface{}{
-				"code":    "bad_gateway",
-				"message": fmt.Sprintf("proxy failed to reach upstream '%s': %v", item.Endpoint, err),
+				"code":    code,
+				"message": hint,
 				"listen":  item.Listen,
 				"engress": item.Engress,
 			},
@@ -441,6 +504,14 @@ func BuildProxyHandler(item ProxyItem, tr *http.Transport) (http.Handler, error)
 			setCORSHeaders(rw, req)
 			rw.WriteHeader(http.StatusNoContent)
 			return
+		}
+
+		// 上游总超时：到点由代理主动放弃并返回 504，而不是陪着客户端一起干等、
+		// 等它自己超时断开（那样只会在日志里留下一串 2m03s 的 502，看不出谁先撤）。
+		if to := item.TimeoutDuration(); to > 0 {
+			ctx, cancel := context.WithTimeout(req.Context(), to)
+			defer cancel()
+			req = req.WithContext(ctx)
 		}
 
 		// 3. Proxy passthrough with full-duplex streaming and zero-buffering

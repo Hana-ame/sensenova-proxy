@@ -79,7 +79,41 @@ The configuration file is a JSON array. Each object contains the **four required
 | `provider` | string | Optional. `sensenova` (default), `openai`, `opencode`, or `passthrough`. Auto-detected from the endpoint host when omitted — any `opencode.ai` endpoint runs the free-tier lane. | `"opencode"` |
 | `custom_models` | string[] | Optional (opencode lane). Extra model ids injected into the `/v1/models` response so clients see them as available — useful for names the upstream does not actually serve (e.g. `"dsv41f"`). | `["dsv41f"]` |
 | `models_mode` | string | Optional. `append` (default) merges `custom_models` into the upstream list; `replace` serves only `custom_models`. | `"append"`, `"replace"` |
+| `timeout` | float | Optional (v1.3.1+). Total upstream budget in seconds — from request send to response end. `0`/omitted = no proxy-side limit (pre-v1.3.1 behaviour). | `120` |
+| `first_byte_timeout` | float | Optional (v1.3.1+). Seconds to wait for the upstream **response headers** ("first byte"). Only bounds queueing/connecting: once headers arrive the stream is no longer limited, so it never truncates a healthy long SSE stream. | `30` |
 | `sources` | object[] | **Multi-source aggregate ("一拖多")** — when set, this instance becomes an aggregate endpoint: clients configure a single baseURL and the proxy tries sources in order, auto-failing over when one is exhausted (429 / `FreeUsageLimitError`) with cooldown until the next UTC midnight. Each source fixes its own egress: no client-side param needed. See below. | see below |
+
+### Timeouts (v1.3.1+)
+
+By default the proxy waits on the upstream as long as the client does, so a slow
+upstream always ends with the **client** giving up first — which the proxy can only
+record as `502 ... context canceled`, with nothing to say who hung up. Two optional
+per-instance fields let the proxy set its own budget instead:
+
+| Field | Bounds | Use when |
+|---|---|---|
+| `timeout` | whole request, including body streaming | you want a hard ceiling per request |
+| `first_byte_timeout` | only the wait for response headers | upstream is queueing; generation itself is fine |
+
+```json
+{ "endpoint": "https://token.sensenova.cn", "Authkey": "sk-...", "listen": "127.0.0.1:8001",
+  "timeout": 120, "first_byte_timeout": 30 }
+```
+
+Both are `0` (unlimited) when omitted, so existing configs behave exactly as before.
+
+The failure mode is now explicit instead of ambiguous:
+
+| Situation | Status | `error.code` | Log line |
+|---|---|---|---|
+| Upstream exceeded `timeout` / `first_byte_timeout` | `504` | `upstream_timeout` | `upstream deadline exceeded (budget=...)` |
+| Client hung up while proxy was still waiting | `502` | `client_disconnected` | `client hung up before upstream answered (... not a proxy fault)` |
+| Proxy could not reach upstream at all | `502` | `bad_gateway` | `Upstream failure: ...` |
+
+That `client_disconnected` row is the one that used to be misread: a cluster of
+`502`s all landing on the same duration (e.g. `2m03s`) is the client's own timeout
+firing, not the proxy failing. Look at the client timeout — or set
+`first_byte_timeout` below it so the proxy answers first with an actionable `504`.
 
 ### Multi-source aggregate (`sources`)
 

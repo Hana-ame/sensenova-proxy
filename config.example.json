@@ -48,6 +48,15 @@
   },
 
   {
+    "endpoint": "https://token.sensenova.cn",
+    "Authkey": "sk-example-key-instance-5",
+    "engress": "",
+    "listen": "127.0.0.1:8005",
+    "timeout": 120,
+    "first_byte_timeout": 30
+  },
+
+  {
     "listen": "127.0.0.1:8020",
     "sources": [
       { "name": "vps-v4",    "endpoint": "https://vps.moonchan.xyz",        "net": "v4" },
