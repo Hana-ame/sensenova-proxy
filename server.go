@@ -83,19 +83,28 @@ func (m *ProxyManager) Start() error {
 			egressDesc = "(default route)"
 		}
 
-		toDesc := "timeout: none"
-		if to := item.TimeoutDuration(); to > 0 {
-			toDesc = fmt.Sprintf("timeout: %v", to)
+		// 超时描述要区分三种情况：未配（走默认 90s）、显式关闭（负数）、
+		// 显式设置（含被 90s 钳过的）。只写 "none" 会让人以为完全不限制，
+		// 而实际默认是有上限的——这正是 2m03s 那批 502 的由来。
+		toDesc := fmt.Sprintf("timeout: %v", item.TimeoutDuration())
+		if item.TimeoutSecs == 0 {
+			toDesc += " (default)"
+		} else if item.TimeoutSecs < 0 {
+			toDesc = "timeout: disabled"
+		} else if item.TimeoutSecs > maxWaitBudget.Seconds() {
+			toDesc += fmt.Sprintf(" (configured %.0fs clamped)", item.TimeoutSecs)
 		}
-		if fb := item.FirstByteDuration(); fb > 0 {
-			toDesc += fmt.Sprintf(", first_byte: %v", fb)
-		}
-		// 配置值被 90s 硬上限钳过就明说，否则用户以为自己设了 10 分钟。
-		if item.TimeoutSecs > maxWaitBudget.Seconds() {
-			toDesc += fmt.Sprintf(" (configured %.0fs clamped to %v)", item.TimeoutSecs, maxWaitBudget)
-		}
-		if item.FirstByteSecs > maxWaitBudget.Seconds() {
-			toDesc += fmt.Sprintf(" (first_byte configured %.0fs clamped to %v)", item.FirstByteSecs, maxWaitBudget)
+
+		switch {
+		case item.FirstByteSecs < 0:
+			toDesc += ", first_byte: disabled"
+		case item.FirstByteSecs == 0:
+			toDesc += fmt.Sprintf(", first_byte: %v (default)", maxWaitBudget)
+		case item.FirstByteSecs > maxWaitBudget.Seconds():
+			toDesc += fmt.Sprintf(", first_byte: %v (configured %.0fs clamped)",
+				maxWaitBudget, item.FirstByteSecs)
+		default:
+			toDesc += fmt.Sprintf(", first_byte: %v", item.FirstByteDuration())
 		}
 
 		sessDesc := fmt.Sprintf("session: %s", item.SessionFallbackMode())

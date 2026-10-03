@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
@@ -804,7 +805,22 @@ loop:
 		case m, ok := <-raw:
 			if !ok || m.eof {
 				if m.err != nil && !finished {
-					b.meta.logf("midstream_error", "err=%v", m.err)
+					// 响应头早已发出（客户端看到的是 200），所以这里改不了状态码，
+					// 只能靠日志解释"为什么流突然断了"。三种情况必须分开：
+					// 代理自己的预算到期（客户端该重试）/ 客户端先撤（不是代理的错）
+					// / 上游真的坏了。
+					switch {
+					case errors.Is(m.err, context.DeadlineExceeded):
+						b.meta.logf("stream_truncated",
+							"took=%s cause=proxy_timeout_budget_expired note=client_saw_200_then_stream_ended; response headers were already sent so the status code cannot be changed",
+							round1(time.Since(started)))
+					case errors.Is(m.err, context.Canceled):
+						b.meta.logf("stream_truncated",
+							"took=%s cause=client_gone note=not a proxy fault", round1(time.Since(started)))
+					default:
+						b.meta.logf("stream_truncated",
+							"took=%s cause=upstream_error err=%v", round1(time.Since(started)), m.err)
+					}
 				}
 				if !finished && !doneSent && !injected {
 					if !send(idleInject(b.model)) {

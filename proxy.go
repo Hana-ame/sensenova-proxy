@@ -171,6 +171,58 @@ func isTimeoutErr(err error) bool {
 	return strings.Contains(strings.ToLower(err.Error()), "timeout awaiting response headers")
 }
 
+// isStreamingResponse 判断响应是否是流式的（SSE 或 chunked）。这类响应的
+// 特点是响应头一旦发出就定死了状态码，之后出问题没法改，只能靠日志解释。
+func isStreamingResponse(resp *http.Response) bool {
+	if resp == nil || resp.Body == nil {
+		return false
+	}
+	if ct := resp.Header.Get("Content-Type"); strings.Contains(ct, "text/event-stream") {
+		return true
+	}
+	// 没有 Content-Length 的 2xx 响应就是边收边发。
+	if resp.ContentLength < 0 && resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		return true
+	}
+	return false
+}
+
+// wrapStreamWithContextWatcher 给响应体套一层，把"流为什么断了"记到 meta 上。
+// 响应头此时已经发出，状态码改不了，这是唯一能解释"客户端看到 200 然后流突然
+// 断了"的线索。透传所有读写行为，不改变字节与时序。
+//
+// 判定依据是**上游请求的 ctx 状态**，不是 Read 返回的错误值：实测预算到期时
+// Read 拿到的是 context.Canceled（httputil 把它当"客户端走了"直接静默
+// return，连它自己的 ErrorLog 都不打），而不是 DeadlineExceeded。所以光看
+// 错误类型会漏判，必须查 ctx.Err()。
+func wrapStreamWithContextWatcher(resp *http.Response, meta *reqMeta, reqCtx context.Context) {
+	if meta == nil || resp == nil || resp.Body == nil {
+		return
+	}
+	resp.Body = &ctxWatchBody{ReadCloser: resp.Body, meta: meta, reqCtx: reqCtx}
+}
+
+// ctxWatchBody 是透明的 ReadCloser，只在读出错时留痕。
+type ctxWatchBody struct {
+	io.ReadCloser
+	meta   *reqMeta
+	reqCtx context.Context
+}
+
+func (b *ctxWatchBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	if err == nil || errors.Is(err, io.EOF) {
+		return n, err
+	}
+	// 错误类型不可靠（Canceled / DeadlineExceeded 都可能），用 ctx 判原因。
+	if cerr := b.reqCtx.Err(); cerr != nil {
+		b.meta.setTruncReason(cerr)
+	} else {
+		b.meta.setTruncReason(err)
+	}
+	return n, err
+}
+
 // isCloudflareHeader checks if an HTTP header is injected by Cloudflare for tracking, CDN telemetry, or identification.
 func isCloudflareHeader(name, val string) bool {
 	lowerName := strings.ToLower(name)
@@ -211,9 +263,19 @@ func isCloudflareHeader(name, val string) bool {
 
 // responseRecorder captures the status code written to ResponseWriter for logging,
 // and ensures immediate unbuffered flushing on every single write.
+//
+// 它还负责"响应头已发出、之后 body 被掐断"这种流式场景的可观测性：客户端
+// 看到的是 200，然后流毫无预兆地结束，状态码改不了（HTTP 头早就发出去了）。
+// 没有日志就只能猜。这里记下首次写 body 的错误与是否正常收尾，handler 收尾
+// 时统一打一行 stream_truncated。
 type responseRecorder struct {
 	http.ResponseWriter
 	statusCode int
+
+	started  bool     // 是否已经写过 body（即响应头已发出）
+	writeErr error    // 首次非 nil 的写错误
+	finished bool     // 正常写完（无错误）
+	meta     *reqMeta // 用于结构化日志，可为 nil
 }
 
 func (rec *responseRecorder) WriteHeader(code int) {
@@ -223,6 +285,15 @@ func (rec *responseRecorder) WriteHeader(code int) {
 
 func (rec *responseRecorder) Write(b []byte) (int, error) {
 	n, err := rec.ResponseWriter.Write(b)
+	if n > 0 || len(b) == 0 {
+		rec.started = true
+	}
+	if err != nil && rec.writeErr == nil {
+		rec.writeErr = err
+	}
+	if err == nil && n == len(b) {
+		rec.finished = true
+	}
 	if flusher, ok := rec.ResponseWriter.(http.Flusher); ok {
 		flusher.Flush()
 	}
@@ -416,6 +487,17 @@ func BuildProxyHandler(item ProxyItem, tr *http.Transport) (http.Handler, error)
 			}
 		}
 
+		// 流式响应（任意 content-type，不只是 opencode）：挂一个监视上游
+		// context 的 goroutine。httputil.ReverseProxy 在 body copy 读到非 EOF
+		// 错误时只往它自己的 ErrorLog 打一行就返回，错误**不经过**
+		// ResponseWriter.Write，所以包装响应体抓不到（实测 90s 预算到期时
+		// Write 一次错误都没收到）。这里直接盯 ctx：预算到期或客户端断开都会
+		// 让这里拿到确切原因，handler 收尾时就能打出一行可解释的日志——否则
+		// 客户端只看到 200 然后流突然断掉，无从判断发生了什么。
+		if isStreamingResponse(resp) {
+			wrapStreamWithContextWatcher(resp, metaFrom(resp.Request.Context()), resp.Request.Context())
+		}
+
 		// 回显本次请求的 rid / session，客户端出问题时报一个 rid 就能在日志里
 		// 捞出全部相关行；session 也可见，便于确认同一会话确实命中了同一个
 		// 上游 session。
@@ -448,7 +530,6 @@ func BuildProxyHandler(item ProxyItem, tr *http.Transport) (http.Handler, error)
 		return nil
 	}
 
-	// ErrorHandler provides clear JSON errors on network failures
 	proxy.ErrorHandler = func(rw http.ResponseWriter, req *http.Request, err error) {
 		// 区分"上游超时"与"客户端自己断开"。两者以前都记成
 		// `Upstream failure: context canceled` + 502，看着像代理故障，实际常常
@@ -548,15 +629,43 @@ func BuildProxyHandler(item ProxyItem, tr *http.Transport) (http.Handler, error)
 		rc := http.NewResponseController(rw)
 		_ = rc.EnableFullDuplex()
 
+		// 上游 ctx 一到期（预算耗尽 / 客户端断开）就立刻记一笔。不挂在收尾
+		// 逻辑上：实测流被掐断时 ServeHTTP 之后的代码可能根本不会执行到
+		// （httputil 走 panic(ErrAbortHandler) 直接终结连接），所以日志必须
+		// 在事件发生的那一刻打出来，不能等 defer。
+		watchDone := make(chan struct{})
+		defer close(watchDone)
+		go func() {
+			select {
+			case <-req.Context().Done():
+				meta.setTruncReason(req.Context().Err())
+				meta.logTruncated(req.Method, req.URL.Path, round1(time.Since(start)))
+			case <-watchDone:
+			}
+		}()
+
 		rec := &responseRecorder{
 			ResponseWriter: rw,
 			statusCode:     http.StatusOK,
+			meta:           meta,
 		}
 
 		proxy.ServeHTTP(rec, req)
 
 		duration := time.Since(start)
 		meta.logf("done", "%s %s -> %d took=%s", req.Method, req.URL.Path, rec.statusCode, round1(duration))
+
+		// 流式响应一旦开了头，状态码就定死了——客户端看到 200 然后流突然断掉，
+		// 不会有任何错误信息。这一行是唯一的解释，必须打。SSE pump 自己也会
+		// 打一条 stream_truncated（它能区分得更细），这里只做兜底：非 2xx 或
+		// 没写过 body 的路径不算截断，交给 ErrorHandler 的日志。
+		// ctx 被取消时上面的 goroutine 已经打过 stream_truncated；这里只在
+		// ctx 活着但 body 写失败时兜底（例如上游提前断）。
+		if _, ok := meta.truncCause(); !ok && rec.started && rec.writeErr != nil {
+			meta.logf("stream_truncated",
+				"status=%d took=%s cause=write_error err=%v note=headers_already_sent",
+				rec.statusCode, round1(duration), rec.writeErr)
+		}
 	})
 
 	return handler, nil

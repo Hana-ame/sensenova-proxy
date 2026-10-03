@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"io"
 	"log"
 	"net/http"
@@ -258,4 +260,123 @@ func TestSessionMarkerAcceptsWellFormedValue(t *testing.T) {
 	if got := sanitizeSessionMarker(good); got != good {
 		t.Errorf("well-formed marker was rewritten: %q", got)
 	}
+}
+
+func TestTruncCauseRecordedOnce(t *testing.T) {
+	m := &reqMeta{rid: "x"}
+	if _, ok := m.truncCause(); ok {
+		t.Error("fresh meta reported a truncation cause")
+	}
+	m.setTruncReason(nil)
+	if _, ok := m.truncCause(); ok {
+		t.Error("nil error was recorded as a cause")
+	}
+	m.setTruncReason(context.DeadlineExceeded)
+	m.setTruncReason(io.ErrUnexpectedEOF) // 第二个应被忽略
+	cause, ok := m.truncCause()
+	if !ok || !errors.Is(cause, context.DeadlineExceeded) {
+		t.Errorf("truncCause = (%v, %v), want the first error", cause, ok)
+	}
+}
+
+func TestCtxWatchBodyRecordsReadError(t *testing.T) {
+	m := &reqMeta{rid: "x"}
+	src := io.NopCloser(&errReader{data: []byte("partial"), err: context.DeadlineExceeded})
+	resp := &http.Response{Body: src, StatusCode: 200}
+	wrapStreamWithContextWatcher(resp, m, context.Background())
+
+	buf := make([]byte, 64)
+	// 第一次读拿到数据（err 为 nil），第二次读才拿到源错误。
+	resp.Body.Read(buf)
+	_, err := resp.Body.Read(buf)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("read err = %v, want DeadlineExceeded surfaced", err)
+	}
+	if cause, ok := m.truncCause(); !ok || !errors.Is(cause, context.DeadlineExceeded) {
+		t.Errorf("truncCause = (%v, %v), want DeadlineExceeded", cause, ok)
+	}
+}
+
+func TestCtxWatchBodyUsesCtxNotErrorType(t *testing.T) {
+	// 实测：预算到期时 Read 拿到的是 context.Canceled，而不是 DeadlineExceeded
+	//（httputil 把它当"客户端走了"静默 return）。所以原因必须从 ctx 读，
+	// 否则会把"代理预算到期"误标成"客户端先撤"。
+	m := &reqMeta{rid: "x"}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond)
+	defer cancel()
+	time.Sleep(5 * time.Millisecond) // 确保 ctx 已到期
+
+	src := io.NopCloser(&errReader{data: []byte("x"), err: context.Canceled})
+	resp := &http.Response{Body: src, StatusCode: 200}
+	wrapStreamWithContextWatcher(resp, m, ctx)
+	resp.Body.Read(make([]byte, 8))
+	resp.Body.Read(make([]byte, 8))
+
+	cause, ok := m.truncCause()
+	if !ok || !errors.Is(cause, context.DeadlineExceeded) {
+		t.Errorf("truncCause = (%v, %v), want DeadlineExceeded taken from ctx", cause, ok)
+	}
+}
+
+func TestCtxWatchBodyFallsBackToReadError(t *testing.T) {
+	// ctx 还活着但源坏了：原因只能取 Read 的错误。
+	m := &reqMeta{rid: "x"}
+	src := io.NopCloser(&errReader{data: []byte("x"), err: io.ErrUnexpectedEOF})
+	resp := &http.Response{Body: src, StatusCode: 200}
+	wrapStreamWithContextWatcher(resp, m, context.Background())
+	resp.Body.Read(make([]byte, 8))
+	resp.Body.Read(make([]byte, 8))
+	if cause, ok := m.truncCause(); !ok || !errors.Is(cause, io.ErrUnexpectedEOF) {
+		t.Errorf("truncCause = (%v, %v), want the read error", cause, ok)
+	}
+}
+
+func TestCtxWatchBodyPassesThroughCleanReads(t *testing.T) {
+	m := &reqMeta{rid: "x"}
+	resp := &http.Response{Body: io.NopCloser(strings.NewReader("hello")), StatusCode: 200}
+	wrapStreamWithContextWatcher(resp, m, context.Background())
+	got, _ := io.ReadAll(resp.Body)
+	if string(got) != "hello" {
+		t.Errorf("body = %q, want %q", got, "hello")
+	}
+	if _, ok := m.truncCause(); ok {
+		t.Error("clean body recorded a truncation")
+	}
+}
+
+func TestIsStreamingResponse(t *testing.T) {
+	sse := &http.Response{Header: http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body: io.NopCloser(strings.NewReader("")), StatusCode: 200, ContentLength: -1}
+	if !isStreamingResponse(sse) {
+		t.Error("SSE response not detected as streaming")
+	}
+	chunked := &http.Response{Header: http.Header{}, Body: io.NopCloser(strings.NewReader("")),
+		StatusCode: 200, ContentLength: -1}
+	if !isStreamingResponse(chunked) {
+		t.Error("chunked 2xx not detected as streaming")
+	}
+	fixed := &http.Response{Header: http.Header{"Content-Type": []string{"application/json"}},
+		Body: io.NopCloser(strings.NewReader("{}")), StatusCode: 200, ContentLength: 2}
+	if isStreamingResponse(fixed) {
+		t.Error("fixed-length JSON wrongly detected as streaming")
+	}
+	if isStreamingResponse(nil) {
+		t.Error("nil response reported as streaming")
+	}
+}
+
+// errReader 先吐出 data 再返回 err，用来模拟"流到一半被掐断"。
+type errReader struct {
+	data []byte
+	err  error
+	done bool
+}
+
+func (r *errReader) Read(p []byte) (int, error) {
+	if r.done {
+		return 0, r.err
+	}
+	r.done = true
+	n := copy(p, r.data)
+	return n, nil
 }

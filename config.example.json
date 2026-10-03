@@ -52,8 +52,8 @@
     "Authkey": "sk-example-key-instance-5",
     "engress": "",
     "listen": "127.0.0.1:8005",
-    "timeout": 60,
-    "first_byte_timeout": 25,
+    "timeout": 90,
+    "first_byte_timeout": 45,
     "session_header": "X-Session-Id",
     "session_fallback": "client"
   },

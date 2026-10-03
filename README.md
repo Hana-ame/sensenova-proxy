@@ -79,8 +79,8 @@ The configuration file is a JSON array. Each object contains the **four required
 | `provider` | string | Optional. `sensenova` (default), `openai`, `opencode`, or `passthrough`. Auto-detected from the endpoint host when omitted — any `opencode.ai` endpoint runs the free-tier lane. | `"opencode"` |
 | `custom_models` | string[] | Optional (opencode lane). Extra model ids injected into the `/v1/models` response so clients see them as available — useful for names the upstream does not actually serve (e.g. `"dsv41f"`). | `["dsv41f"]` |
 | `models_mode` | string | Optional. `append` (default) merges `custom_models` into the upstream list; `replace` serves only `custom_models`. | `"append"`, `"replace"` |
-| `timeout` | float | Optional (v1.3.1+). Total upstream budget in seconds — from request send to response end. `0`/omitted = no proxy-side limit (pre-v1.3.1 behaviour). | `120` |
-| `first_byte_timeout` | float | Optional (v1.3.1+). Seconds to wait for the upstream **response headers** ("first byte"). Only bounds queueing/connecting: once headers arrive the stream is no longer limited, so it never truncates a healthy long SSE stream. | `30` |
+| `timeout` | float | Optional (v1.3.1+). Total upstream budget in seconds — from request send to response end. Omitted = 90s default; negative = no proxy-side limit; positive values are clamped to 90s. | `90` |
+| `first_byte_timeout` | float | Optional (v1.3.1+). Seconds to wait for the upstream **response headers** ("first byte"). Only bounds queueing/connecting: once headers arrive the stream is no longer limited, so it never truncates a healthy long SSE stream. Omitted = 90s default; negative = unlimited. | `90` |
 | `session_header` | string | Optional (v1.3.2+). Name of the **client** request header to take the session id from. Its value is normalised to a valid `ses_*` id and forwarded as `X-Session-Id` / `X-Session-Affinity` / `X-Opencode-Session`, so every request of one conversation lands on the same upstream session (upstream free quota is per-session). | `"X-Session-Id"` |
 | `session_fallback` | string | Optional (v1.3.2+). What to do when the client sends no session header: `client` (default, stable per client IP), `instance` (one fixed value for the whole instance), `request` (new session per request — splits the upstream quota, avoid). | `"client"` |
 | `sources` | object[] | **Multi-source aggregate ("一拖多")** — when set, this instance becomes an aggregate endpoint: clients configure a single baseURL and the proxy tries sources in order, auto-failing over when one is exhausted (429 / `FreeUsageLimitError`) with cooldown until the next UTC midnight. Each source fixes its own egress: no client-side param needed. See below. | see below |
@@ -102,7 +102,11 @@ per-instance fields let the proxy set its own budget instead:
   "timeout": 120, "first_byte_timeout": 30 }
 ```
 
-Both are `0` (unlimited) when omitted, so existing configs behave exactly as before.
+**Both default to 90s when omitted.** Omitting them is *not* "no limit" — that
+was v1.3.1–v1.3.3 behaviour and it is exactly what produced the `client_gone ...
+took=2m3s` log lines: the proxy sat waiting until the client gave up first, then
+could only record `502`. Defaults must be safe values. Use a **negative** value
+(`-1`) to genuinely disable one of them; any positive value is clamped to 90s.
 
 **Hard cap: 90s.** Cloudflare drops a connection that has not produced response
 headers within 100s and returns a bare `524` — no error detail reaches the client
@@ -166,6 +170,7 @@ rid=3f9a2b1c listen=127.0.0.1:3000 model=big-pickle provider=opencode client=127
 | `client_gone` | client hung up first — explicitly *not* a proxy fault → `502` |
 | `gate_error` | upstream refused the free-tier request; `class` is in the `X-Opencode-Gate` response header |
 | `body_rewrite_failed` / `models_parse_failed` | request or `/v1/models` body was passed through untouched |
+| `stream_truncated` | the stream was cut **after** the 200 header went out, so the status code could not be changed. `cause` is `proxy_timeout_budget_expired` (retry) or `client_gone` (not your fault). This line is the only explanation the client ever gets. |
 
 Both `X-Proxy-RID` and `X-Proxy-Session` come back on the response (success and
 error alike), so a client can report the rid it saw.

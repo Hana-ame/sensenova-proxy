@@ -46,12 +46,22 @@ func TestTimeoutConfigParsing(t *testing.T) {
 }
 
 func TestTimeoutDurationHelpers(t *testing.T) {
+	// 未配置走 90s 默认值，而不是"不限制"——这正是 v1.3.1/1.3.2/1.3.3 那些
+	// `client_gone ... took=2m3s` 的根因：没配就一直陪客户端等到它自己断开。
 	unset := ProxyItem{}
-	if got := unset.TimeoutDuration(); got != 0 {
-		t.Errorf("unset TimeoutDuration = %v, want 0", got)
+	if got := unset.TimeoutDuration(); got != maxWaitBudget {
+		t.Errorf("unset TimeoutDuration = %v, want default %v", got, maxWaitBudget)
 	}
-	if got := unset.FirstByteDuration(); got != 0 {
-		t.Errorf("unset FirstByteDuration = %v, want 0", got)
+	if got := unset.FirstByteDuration(); got != maxWaitBudget {
+		t.Errorf("unset FirstByteDuration = %v, want default %v", got, maxWaitBudget)
+	}
+	// 负数是显式关闭。
+	off := ProxyItem{TimeoutSecs: -1, FirstByteSecs: -1}
+	if got := off.TimeoutDuration(); got != 0 {
+		t.Errorf("disabled TimeoutDuration = %v, want 0", got)
+	}
+	if got := off.FirstByteDuration(); got != 0 {
+		t.Errorf("disabled FirstByteDuration = %v, want 0", got)
 	}
 	withTO := ProxyItem{TimeoutSecs: 1.5}
 	if got := withTO.TimeoutDuration(); got != 1500*time.Millisecond {
@@ -60,6 +70,18 @@ func TestTimeoutDurationHelpers(t *testing.T) {
 	withFB := ProxyItem{FirstByteSecs: 0.25}
 	if got := withFB.FirstByteDuration(); got != 250*time.Millisecond {
 		t.Errorf("FirstByteDuration = %v, want 250ms", got)
+	}
+}
+
+// 回归：v1.3.3 及之前"不配 = 不限制"，导致代理会等超过 Cloudflare 的 100s
+// 而让 CF 先掐连接（524）。未配置也必须有上限。
+func TestUnsetTimeoutStillBoundedBelowCloudflare(t *testing.T) {
+	p := ProxyItem{}
+	if p.TimeoutDuration() >= 100*time.Second {
+		t.Errorf("unset TimeoutDuration = %v, must stay under Cloudflare's 100s", p.TimeoutDuration())
+	}
+	if p.FirstByteDuration() >= 100*time.Second {
+		t.Errorf("unset FirstByteDuration = %v, must stay under Cloudflare's 100s", p.FirstByteDuration())
 	}
 }
 

@@ -177,15 +177,19 @@ func strAny(v interface{}) string {
 	return ""
 }
 
-// maxWaitBudget 是代理允许等上游的硬上限。
+// maxWaitBudget 是代理允许等上游的硬上限，同时是**默认值**。
 //
 // Cloudflare 默认 100s 拿不到源站首字节就断连接并回 524 —— 客户端看到的是
 // 一个没有任何错误细节的 HTML 页面，代理侧日志里也什么都看不到（CF 早就
 // 把连接掐了）。所以代理必须抢在 CF 之前自己收尾：90s 上限留了 10s 余量，
 // 让 504 + JSON 错误能真正送到客户端。
 //
-// 无论配置写成多少，都会被钳到这个值。需要更长等待的场景（例如流式生成
-// 本来就慢）应该调客户端超时或换更快的上游，而不是放宽这个上限。
+// 无论配置写成多少，都会被钳到这个值。**没配也按这个值算**，不是"不配就不
+// 限制"：实测日志里那些 `client_gone ... took=2m3s` 就是没配任何超时的产物
+// —— 代理陪着等到客户端自己超时断开，只能被动记 502。默认值必须是安全值。
+//
+// 需要更长等待的场景应该调客户端超时或换更快的上游，而不是放宽这个上限。
+// 真要显式关掉，用 timeout: -1 / first_byte_timeout: -1（见下面两个方法）。
 const maxWaitBudget = 90 * time.Second
 
 // SessionFallbackMode 返回归一化后的会话回退策略，默认 "client"。
@@ -200,19 +204,30 @@ func (p *ProxyItem) SessionFallbackMode() string {
 	}
 }
 
-// TimeoutDuration 返回上游总超时；0 表示不主动超时。超过 maxWaitBudget
-// 会被钳到上限，防止 Cloudflare 先掐断连接（524）。
+// TimeoutDuration 返回上游总超时。
+//
+//	未配置（0）-> maxWaitBudget（90s）：这是默认值，不是"不限制"
+//	负数       -> 0，显式关闭总超时（仍受 first_byte_timeout 约束）
+//	正数       -> 钳到 maxWaitBudget，防止 Cloudflare 先掐断连接（524）
 func (p *ProxyItem) TimeoutDuration() time.Duration {
-	if p.TimeoutSecs <= 0 {
+	if p.TimeoutSecs < 0 {
 		return 0
+	}
+	if p.TimeoutSecs == 0 {
+		return maxWaitBudget
 	}
 	return clampBudget(time.Duration(p.TimeoutSecs * float64(time.Second)))
 }
 
-// FirstByteDuration 返回等待上游响应头的超时；0 表示不限制。
+// FirstByteDuration 返回等待上游响应头的超时，语义同 TimeoutDuration：
+// 未配置走 maxWaitBudget 默认值，负数显式关闭，正数钳到上限。首字节超时是防
+// Cloudflare 524 的主力闸——524 的成因就是"源站迟迟没有响应头"。
 func (p *ProxyItem) FirstByteDuration() time.Duration {
-	if p.FirstByteSecs <= 0 {
+	if p.FirstByteSecs < 0 {
 		return 0
+	}
+	if p.FirstByteSecs == 0 {
+		return maxWaitBudget
 	}
 	return clampBudget(time.Duration(p.FirstByteSecs * float64(time.Second)))
 }

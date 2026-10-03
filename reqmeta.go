@@ -4,11 +4,14 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
 	"strings"
+	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // ---------------------------------------------------------------------------
@@ -41,6 +44,50 @@ type reqMeta struct {
 	clientIP string
 	model    string // filled in by the opencode body rewrite
 	sess     string // stable session marker
+
+	// truncReason 记录流式响应被掐断的原因。httputil.ReverseProxy 在
+	// body copy 中读到非 EOF 错误时，只往自己的 ErrorLog 打一行就直接
+	// 返回——错误不会经过 ResponseWriter.Write，所以包装响应体是抓不到的
+	// （实测 90s 预算到期时 Write 一次错误都没收到）。而 ErrorLog 是实例
+	// 级的，拿不到 per-request 上下文。折中办法：由 ErrorLog 把原因记到
+	// 一个按请求路由的槽位，handler 收尾时读出来补日志。
+	truncMu     sync.Mutex
+	truncReason error
+}
+
+// setTruncReason 记录流被掐断的原因（只记第一个）。
+func (m *reqMeta) setTruncReason(err error) {
+	if err == nil {
+		return
+	}
+	m.truncMu.Lock()
+	if m.truncReason == nil {
+		m.truncReason = err
+	}
+	m.truncMu.Unlock()
+}
+
+// logTruncated 在流被掐断的当刻打一行日志（不等收尾）。SSE 响应头已发出，
+// 状态码改不了，客户端只看到 200 然后流突然断掉——这行是唯一的解释。
+func (m *reqMeta) logTruncated(method, path string, took time.Duration) {
+	cause, ok := m.truncCause()
+	if !ok {
+		return
+	}
+	causeName := "proxy_timeout_budget_expired"
+	if errors.Is(cause, context.Canceled) {
+		causeName = "client_gone"
+	}
+	m.logf("stream_truncated",
+		"method=%s path=%s took=%s cause=%s err=%v note=headers_already_sent_client_saw_200_then_stream_ended",
+		method, path, took, causeName, cause)
+}
+
+// truncCause 返回流被掐断的原因与是否记录过。
+func (m *reqMeta) truncCause() (error, bool) {
+	m.truncMu.Lock()
+	defer m.truncMu.Unlock()
+	return m.truncReason, m.truncReason != nil
 }
 
 func withReqMeta(req *http.Request, m *reqMeta) *http.Request {
