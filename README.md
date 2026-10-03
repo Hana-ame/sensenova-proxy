@@ -79,6 +79,39 @@ The configuration file is a JSON array. Each object contains the **four required
 | `provider` | string | Optional. `sensenova` (default), `openai`, `opencode`, or `passthrough`. Auto-detected from the endpoint host when omitted — any `opencode.ai` endpoint runs the free-tier lane. | `"opencode"` |
 | `custom_models` | string[] | Optional (opencode lane). Extra model ids injected into the `/v1/models` response so clients see them as available — useful for names the upstream does not actually serve (e.g. `"dsv41f"`). | `["dsv41f"]` |
 | `models_mode` | string | Optional. `append` (default) merges `custom_models` into the upstream list; `replace` serves only `custom_models`. | `"append"`, `"replace"` |
+| `sources` | object[] | **Multi-source aggregate ("一拖多")** — when set, this instance becomes an aggregate endpoint: clients configure a single baseURL and the proxy tries sources in order, auto-failing over when one is exhausted (429 / `FreeUsageLimitError`) with cooldown until the next UTC midnight. Each source fixes its own egress: no client-side param needed. See below. | see below |
+
+### Multi-source aggregate (`sources`)
+
+Instead of pointing a client at several opencode instances and switching manually,
+configure one aggregate listen that fans a request across multiple upstream sources
+in order (wintools `multi-proxy` semantics). When the first source hits the free-tier
+daily limit, it is put in cooldown until the next UTC midnight and later requests
+automatically land on the next source. If every source is exceeded, the proxy returns
+429 `FreeUsageLimitError`.
+
+```json
+{
+  "listen": "127.0.0.1:8020",
+  "sources": [
+    { "name": "vps-v4",    "endpoint": "https://vps.moonchan.xyz",        "net": "v4" },
+    { "name": "vps-v6",    "endpoint": "https://vps.moonchan.xyz",        "net": "v6" },
+    { "name": "cloudcone", "endpoint": "https://cloudcone.moonchan.xyz",  "net": "v4" },
+    { "name": "bwh",       "endpoint": "https://bwh.moonchan.xyz",        "net": "v4" }
+  ]
+}
+```
+
+Source fields: `name` (display, used in `/status`), `endpoint` (upstream opencode
+base URL; when pointing at another api-pack/sensenova-proxy instance, that instance
+handles its own fingerprint/gate), `net` (`v4` / `v6` / `auto`, fixes the outbound
+address family per source via `OPENCODE_NET_V4` / `OPENCODE_NET_V6`), `engress`
+(optional, reuses the same egress binding as single-instance mode).
+
+Endpoints on the aggregate listen: `POST /v1/chat/completions` (streaming and
+non-streaming, with first-chunk pre-read failover), `GET /v1/models` (first healthy
+source), `GET /status` (per-source cooldown/error/exceeded stats). Field names are
+case-insensitive (e.g. `sources` / `Sources`).
 
 *Note: Field names are case-insensitive and support aliases (e.g. `Authkey` / `authkey`, `engress` / `egress`, `provider` / `mode` / `upstream_type`).*
 

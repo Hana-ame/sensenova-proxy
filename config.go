@@ -31,6 +31,11 @@ type ProxyItem struct {
 	CustomModels []string `json:"custom_models"`
 	ModelsMode   string   `json:"models_mode"`
 
+	// Sources 多源聚合（"一拖多"）：非空时该实例为聚合模式——
+	// 客户端只配一个 baseURL，请求按序 failover 到这些 opencode 源
+	// （每源固定 endpoint + net 出口，遇 exceed 冷却到 UTC 午夜自动换源）。
+	SourceItems []openSource `json:"sources"`
+
 	// Parsed upstream target URL
 	TargetURL *url.URL `json:"-"`
 }
@@ -95,7 +100,37 @@ func (p *ProxyItem) UnmarshalJSON(data []byte) error {
 	p.CustomModels = getStrSlice("custom_models", "customModels", "CustomModels", "fake_models", "extra_models")
 	p.ModelsMode = strings.ToLower(getStr("models_mode", "modelsMode", "mode_models", "model_list_mode"))
 
+	// sources: 多源聚合的源列表（每个源可带 name/endpoint/net/engress）
+	if v, ok := raw["sources"]; ok && v != nil {
+		switch val := v.(type) {
+		case []interface{}:
+			for _, s := range val {
+				if sm, ok := s.(map[string]interface{}); ok {
+					src := openSource{}
+					src.Name = strAny(sm["name"])
+					src.Endpoint = strAny(sm["endpoint"])
+					src.Net = strAny(sm["net"])
+					src.Engress = strAny(sm["engress"])
+					if src.Endpoint != "" {
+						p.SourceItems = append(p.SourceItems, src)
+					}
+				}
+			}
+		}
+	}
+
 	return nil
+}
+
+// strAny 辅助：把 interface{} 安全转 string（空返回 ""）。
+func strAny(v interface{}) string {
+	if v == nil {
+		return ""
+	}
+	if s, ok := v.(string); ok {
+		return strings.TrimSpace(s)
+	}
+	return ""
 }
 
 // providerIsValid reports whether a normalized provider value is known.

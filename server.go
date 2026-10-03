@@ -43,13 +43,20 @@ func (m *ProxyManager) Start() error {
 	errChan := make(chan error, len(m.items))
 
 	for i, item := range m.items {
-		tr, err := createTransport(item.Engress)
-		if err != nil {
-			return fmt.Errorf("proxy #%d (%s): failed to create transport for egress '%s': %w",
-				i+1, item.Listen, item.Engress, err)
-		}
+		var handler http.Handler
+		var err error
 
-		handler, err := BuildProxyHandler(item, tr)
+		// 多源聚合模式（"一拖多"）：配置了 sources 时，客户端一个 baseURL
+		// 按序 failover 到多个 opencode 源，遇到 exceed 冷却换源。
+		if len(item.SourceItems) > 0 {
+			handler, err = buildMultiHandler(item.SourceItems)
+		} else {
+			var tr *http.Transport
+			tr, err = createTransport(item.Engress)
+			if err == nil {
+				handler, err = BuildProxyHandler(item, tr)
+			}
+		}
 		if err != nil {
 			return fmt.Errorf("proxy #%d (%s): failed to build handler: %w", i+1, item.Listen, err)
 		}
@@ -57,7 +64,7 @@ func (m *ProxyManager) Start() error {
 		// opencode zen streams can legitimately idle for a while; give them a
 		// longer read/write budget than the default 300s.
 		readTO, writeTO := 300*time.Second, 300*time.Second
-		if item.IsOpencode() {
+		if item.IsOpencode() || len(item.SourceItems) > 0 {
 			readTO, writeTO = 600*time.Second, 600*time.Second
 		}
 
