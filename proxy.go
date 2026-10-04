@@ -124,6 +124,14 @@ func createTransport(egress string) (*http.Transport, error) {
 // setCORSHeaders applies full CORS headers to the response writer.
 // Fixes upstream SenseNova CORS preflight missing issue (DOCS/sensenova-proxy-fix.md).
 func setCORSHeaders(rw http.ResponseWriter, req *http.Request) {
+	// req 可能为 nil：有些路径（如请求体截断后回错误）手上只有 ResponseWriter。
+	// 之前直接解引用会 panic，这里显式兜住。
+	if req == nil {
+		rw.Header().Set("Access-Control-Allow-Origin", "*")
+		rw.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS, PATCH, HEAD")
+		rw.Header().Set("Access-Control-Allow-Credentials", "true")
+		return
+	}
 	origin := req.Header.Get("Origin")
 	if origin != "" {
 		rw.Header().Set("Access-Control-Allow-Origin", origin)
@@ -223,6 +231,41 @@ func (b *ctxWatchBody) Read(p []byte) (int, error) {
 	return n, err
 }
 
+// isTruncatedBodyErr 判断错误是不是"请求体没读完"（客户端中途断开）。
+// 这类 body 转发给上游没有意义；解析失败（非法 JSON）等则 body 是完整的。
+func isTruncatedBodyErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.EOF) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "unexpected eof") ||
+		strings.Contains(msg, "eof") ||
+		strings.Contains(msg, "connection reset by peer") ||
+		strings.Contains(msg, "broken pipe")
+}
+
+// writeIncompleteBody 回 400，说明请求体没传完、没有转发上游。
+func writeIncompleteBody(rw http.ResponseWriter, req *http.Request, meta *reqMeta, item ProxyItem, cause error) {
+	setCORSHeaders(rw, req)
+	rw.Header().Set("X-Proxy-RID", meta.rid)
+	if meta.sess != "" {
+		rw.Header().Set("X-Proxy-Session", meta.sess)
+	}
+	rw.Header().Set("Content-Type", "application/json; charset=utf-8")
+	rw.WriteHeader(http.StatusBadRequest)
+	_ = json.NewEncoder(rw).Encode(map[string]interface{}{
+		"error": map[string]interface{}{
+			"code": "incomplete_request_body",
+			"message": fmt.Sprintf(
+				"client disconnected while sending the request body (%v); the request was not forwarded upstream", cause),
+			"listen": item.Listen,
+		},
+	})
+}
+
 // isCloudflareHeader checks if an HTTP header is injected by Cloudflare for tracking, CDN telemetry, or identification.
 func isCloudflareHeader(name, val string) bool {
 	lowerName := strings.ToLower(name)
@@ -272,13 +315,15 @@ type responseRecorder struct {
 	http.ResponseWriter
 	statusCode int
 
-	started  bool     // 是否已经写过 body（即响应头已发出）
-	writeErr error    // 首次非 nil 的写错误
-	finished bool     // 正常写完（无错误）
-	meta     *reqMeta // 用于结构化日志，可为 nil
+	started     bool     // 是否已经写过 body（即响应头已发出）
+	wroteHeader bool     // WriteHeader 是否已被调用（决定还能不能改状态码）
+	writeErr    error    // 首次非 nil 的写错误
+	finished    bool     // 正常写完（无错误）
+	meta        *reqMeta // 用于结构化日志，可为 nil
 }
 
 func (rec *responseRecorder) WriteHeader(code int) {
+	rec.wroteHeader = true
 	rec.statusCode = code
 	rec.ResponseWriter.WriteHeader(code)
 }
@@ -366,7 +411,23 @@ func BuildProxyHandler(item ProxyItem, tr *http.Transport) (http.Handler, error)
 			applyFingerprintHeaders(req, sess)
 			newBody, model, _, err := rewriteOpencodeBody(req)
 			if err != nil {
-				meta.logf("body_rewrite_failed", "err=%v (forwarding as-is)", err)
+				if isTruncatedBodyErr(err) {
+					// 请求体读不完整（客户端发到一半就断了），转发给上游毫无意义：
+					// 上游拿到的是截断的 JSON，要么 400 要么挂住，白等一轮超时。
+					// 实测日志里 "forwarding as-is" 后面跟的是 502 + took=2m4s，
+					// 纯属浪费。标记出来，由 handler 立刻回 400。
+					meta.setBodyTruncated(err)
+					// Director 里没法直接终止 ServeHTTP，所以再补一刀：把 body
+					// 换成空的、长度归零，RoundTrip 会立刻失败而不是把残缺内容
+					// 发给上游。handler 随后用 bodyTruncated 标记改写成 400。
+					req.Body = http.NoBody
+					req.ContentLength = 0
+					req.GetBody = func() (io.ReadCloser, error) { return http.NoBody, nil }
+					req.Header.Del("Content-Length")
+				} else {
+					// 解析类错误（非法 JSON 等）：body 本身是完整的，可以照原样转发。
+					meta.logf("body_rewrite_failed", "err=%v (forwarding as-is)", err)
+				}
 			} else {
 				meta.model = model
 				req.Body = io.NopCloser(bytes.NewReader(newBody))
@@ -633,13 +694,20 @@ func BuildProxyHandler(item ProxyItem, tr *http.Transport) (http.Handler, error)
 		// 逻辑上：实测流被掐断时 ServeHTTP 之后的代码可能根本不会执行到
 		// （httputil 走 panic(ErrAbortHandler) 直接终结连接），所以日志必须
 		// 在事件发生的那一刻打出来，不能等 defer。
+		// 监视上游 ctx：只在它**先于** handler 结束而取消时才算"流被掐断"。
+		// handler 正常返回后我们会 close(watchDone)，select 随即走另一分支，
+		// 不再理会 ctx —— 这样每个正常请求都不会多打一条假的 stream_truncated。
 		watchDone := make(chan struct{})
-		defer close(watchDone)
 		go func() {
 			select {
 			case <-req.Context().Done():
-				meta.setTruncReason(req.Context().Err())
-				meta.logTruncated(req.Method, req.URL.Path, round1(time.Since(start)))
+				select {
+				case <-watchDone:
+					// handler 已经正常收尾，不是掐断
+				default:
+					meta.setTruncReason(req.Context().Err())
+					meta.logTruncated(req.Method, req.URL.Path, round1(time.Since(start)))
+				}
 			case <-watchDone:
 			}
 		}()
@@ -651,6 +719,25 @@ func BuildProxyHandler(item ProxyItem, tr *http.Transport) (http.Handler, error)
 		}
 
 		proxy.ServeHTTP(rec, req)
+		close(watchDone) // 正常收尾：让监视 goroutine 停止关注 ctx
+
+		// 请求体在转发前就断了：ReverseProxy 仍然会跑一遍（把截断的 body
+		// 发给上游），这里把结果覆盖成 400。日志里那条 took=2m4s 的 502 就是
+		// 这么来的——白等一轮超时换一个必然失败的请求。
+		if berr := meta.truncatedBody(); berr != nil {
+			// Director 已经把 body 换成了空的，所以上游一个字节都没收到。
+			// 这里把结果表达成 400：响应头还没发就正常回 400 + JSON 说明；
+			// 已经发了（ErrorHandler 抢先写过）就只改记录，硬写第二个
+			// WriteHeader 只会留下 "superfluous WriteHeader" 警告。
+			headerSent := rec.wroteHeader
+			if !headerSent {
+				writeIncompleteBody(rw, req, meta, item, berr)
+			}
+			rec.statusCode = http.StatusBadRequest
+			meta.logf("body_truncated",
+				"status=%d took=%s err=%v header_already_sent=%v note=body_not_forwarded_upstream",
+				rec.statusCode, round1(time.Since(start)), berr, headerSent)
+		}
 
 		duration := time.Since(start)
 		meta.logf("done", "%s %s -> %d took=%s", req.Method, req.URL.Path, rec.statusCode, round1(duration))

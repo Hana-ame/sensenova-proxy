@@ -53,6 +53,26 @@ type reqMeta struct {
 	// 一个按请求路由的槽位，handler 收尾时读出来补日志。
 	truncMu     sync.Mutex
 	truncReason error
+
+	bodyErrMu sync.Mutex
+	bodyTrunc error
+}
+
+// setBodyTruncated 标记"客户端在发完请求体前就断开了"。这种请求不该转发给
+// 上游：body 是截断的 JSON，上游只会 400 或挂住。
+func (m *reqMeta) setBodyTruncated(err error) {
+	m.bodyErrMu.Lock()
+	if m.bodyTrunc == nil {
+		m.bodyTrunc = err
+	}
+	m.bodyErrMu.Unlock()
+}
+
+// truncatedBody 返回请求体截断错误（若发生过）。
+func (m *reqMeta) truncatedBody() error {
+	m.bodyErrMu.Lock()
+	defer m.bodyErrMu.Unlock()
+	return m.bodyTrunc
 }
 
 // setTruncReason 记录流被掐断的原因（只记第一个）。

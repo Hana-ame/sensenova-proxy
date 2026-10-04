@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -364,4 +365,40 @@ func (r *errReader) Read(p []byte) (int, error) {
 	r.done = true
 	n := copy(p, r.data)
 	return n, nil
+}
+
+func TestIsTruncatedBodyErr(t *testing.T) {
+	// 客户端中途断开：body 读不完整，转发上游没有意义。
+	for _, e := range []error{
+		io.ErrUnexpectedEOF,
+		fmt.Errorf("read tcp 1.2.3.4:1->5.6.7.8:2: unexpected EOF"),
+		fmt.Errorf("read tcp: connection reset by peer"),
+		fmt.Errorf("write: broken pipe"),
+	} {
+		if !isTruncatedBodyErr(e) {
+			t.Errorf("isTruncatedBodyErr(%v) = false, want true", e)
+		}
+	}
+	// 解析类错误：body 本身是完整的，可以照原样转发。
+	for _, e := range []error{
+		nil,
+		fmt.Errorf("invalid JSON body: unexpected token"),
+		fmt.Errorf("json: cannot unmarshal string into Go value of type int"),
+	} {
+		if isTruncatedBodyErr(e) {
+			t.Errorf("isTruncatedBodyErr(%v) = true, want false", e)
+		}
+	}
+}
+
+func TestBodyTruncatedRecordedOnce(t *testing.T) {
+	m := &reqMeta{rid: "x"}
+	if m.truncatedBody() != nil {
+		t.Error("fresh meta reported a truncated body")
+	}
+	m.setBodyTruncated(io.ErrUnexpectedEOF)
+	m.setBodyTruncated(fmt.Errorf("other"))
+	if got := m.truncatedBody(); !errors.Is(got, io.ErrUnexpectedEOF) {
+		t.Errorf("truncatedBody = %v, want the first error", got)
+	}
 }
